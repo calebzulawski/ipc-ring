@@ -24,6 +24,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "rustix",
+ "shm_open_anonymous",
  "windows",
 ]
 
@@ -68,6 +69,15 @@ dependencies = [
  "libc",
  "linux-raw-sys",
  "windows-sys",
+]
+
+[[package]]
+name = "shm_open_anonymous"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fa96d02384e699382c33ebb2d39c81eb99a517378d56dbca1ff01a861485fa77"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

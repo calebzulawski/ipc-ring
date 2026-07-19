@@ -221,7 +221,7 @@ fn validate_capacity(capacity: usize, page: usize, granularity: usize) -> io::Re
             "capacity must be a nonzero power of two",
         ));
     }
-    if capacity < granularity || capacity % granularity != 0 {
+    if capacity < granularity || !capacity.is_multiple_of(granularity) {
         return Err(error::invalid_layout(
             "capacity must match allocation granularity",
         ));

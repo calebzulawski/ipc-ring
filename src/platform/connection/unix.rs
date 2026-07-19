@@ -1,6 +1,6 @@
 use std::ffi::CString;
 use std::io;
-use std::os::fd::OwnedFd;
+use std::os::fd::{FromRawFd, OwnedFd};
 
 pub(crate) struct SharedMemoryObject {
     descriptor: OwnedFd,
@@ -9,47 +9,18 @@ pub(crate) struct SharedMemoryObject {
 
 impl SharedMemoryObject {
     pub(crate) fn anonymous(shared_memory_len: u64) -> io::Result<Self> {
-        #[cfg(target_os = "linux")]
-        {
-            let descriptor = rustix::fs::memfd_create("ipc-ring", rustix::fs::MemfdFlags::CLOEXEC)
-                .map_err(io::Error::from)?;
-            let result = Self {
-                descriptor,
-                owned_name: None,
-            };
-            result.set_len(shared_memory_len)?;
-            Ok(result)
+        let descriptor = shm_open_anonymous::shm_open_anonymous();
+        if descriptor == -1 {
+            return Err(io::Error::last_os_error());
         }
-
-        #[cfg(target_os = "macos")]
-        {
-            use std::sync::atomic::{AtomicU64, Ordering};
-
-            static NEXT: AtomicU64 = AtomicU64::new(0);
-            for _ in 0..128 {
-                let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
-                let pid = std::process::id();
-                let name = CString::new(format!("/ipc-ring-{pid}-{sequence}")).unwrap();
-                match open_new(&name) {
-                    Ok(descriptor) => {
-                        // Unlinking retains the open object.
-                        let _ = rustix::shm::unlink(name.as_c_str());
-                        let result = Self {
-                            descriptor,
-                            owned_name: None,
-                        };
-                        result.set_len(shared_memory_len)?;
-                        return Ok(result);
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                    Err(error) => return Err(error),
-                }
-            }
-            Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "shared-memory name exhaustion",
-            ))
-        }
+        // SAFETY: shm_open_anonymous returned a new, owned descriptor.
+        let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+        let result = Self {
+            descriptor,
+            owned_name: None,
+        };
+        result.set_len(shared_memory_len)?;
+        Ok(result)
     }
 
     pub(crate) fn bind(name: &str, shared_memory_len: u64) -> io::Result<Self> {

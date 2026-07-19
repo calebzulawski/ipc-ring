@@ -220,7 +220,7 @@ fn validate_capacity(capacity: usize, page: usize) -> io::Result<()> {
             "capacity must be a nonzero power of two",
         ));
     }
-    if capacity < page || capacity % page != 0 {
+    if capacity < page || !capacity.is_multiple_of(page) {
         return Err(error::invalid_layout("capacity must be page aligned"));
     }
     if capacity as u128 > 1_u128 << 63 {
