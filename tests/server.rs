@@ -190,9 +190,9 @@ async fn named_waits_use_the_notification_stream() {
 }
 
 #[tokio::test]
-async fn unknown_port_and_duplicate_registration_are_reported() {
+async fn unknown_duplicate_and_retired_ports_are_handled() {
     let server = RunningServer::start("ports");
-    let _producer = server.server.register("telemetry").spsc(1).unwrap();
+    let producer = server.server.register("telemetry").spsc(1).unwrap();
     assert_eq!(
         Consumer::connect(&server.endpoint, "missing")
             .await
@@ -211,6 +211,9 @@ async fn unknown_port_and_duplicate_registration_are_reported() {
             .kind(),
         ErrorKind::AlreadyExists
     );
+
+    drop(producer);
+    let _replacement = server.server.register("telemetry").spsc(1).unwrap();
 }
 
 #[tokio::test]

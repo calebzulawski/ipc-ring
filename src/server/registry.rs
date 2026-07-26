@@ -56,7 +56,6 @@ impl ServerRegistry {
 
     fn register_spsc(&self, port: String, minimum_capacity: usize) -> io::Result<Producer> {
         crate::handshake::validate_port(&port)?;
-        let registered_ring = RegisteredRing::create(minimum_capacity)?;
         let mut rings_by_port = self
             .rings_by_port
             .lock()
@@ -64,6 +63,8 @@ impl ServerRegistry {
         if rings_by_port.get(&port).and_then(Weak::upgrade).is_some() {
             return Err(io::Error::from(io::ErrorKind::AlreadyExists));
         }
+
+        let registered_ring = RegisteredRing::create(minimum_capacity)?;
         rings_by_port.insert(port, Arc::downgrade(&registered_ring));
         drop(rings_by_port);
 
