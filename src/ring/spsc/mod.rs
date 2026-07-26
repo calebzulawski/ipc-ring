@@ -3,16 +3,17 @@
 mod abi;
 mod anonymous;
 mod consumer;
+pub(crate) mod notification;
 mod producer;
+mod shared;
 mod state;
 
 #[cfg(test)]
 mod tests;
 
 pub use anonymous::anonymous;
-pub use consumer::{Consumer, ReadGrant};
+pub use consumer::{ConnectOptions, Consumer, ReadGrant};
 pub use producer::{Producer, WriteGrant};
 
-pub(crate) use abi::{ABI_VERSION, CONSUMER_CLAIMED, CONSUMER_FREE, Header};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) use abi::{IDLE, WAITING};
+pub(crate) use abi::{ABI_VERSION, Header, IDLE, WAITING};
+pub(crate) use shared::{RegisteredRing, SharedRing};

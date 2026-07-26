@@ -1,29 +1,97 @@
-use super::{capacity_for_minimum, wait_for_version};
+use super::{capacity_for_minimum, read_version};
 use crate::error;
-use crate::platform::connection::{Connection, InitializationDeadline, SharedMemoryObject};
-use crate::platform::sys::windows::windows_error;
 use crate::ring::spsc::{ABI_VERSION, Header};
+use crate::sys::windows::{owned, windows_error};
 use std::io;
 use std::mem::size_of;
+use std::os::windows::io::{AsRawHandle, OwnedHandle, RawHandle};
 use std::ptr::{self, NonNull};
 use std::sync::atomic::Ordering;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Memory::{
-    FILE_MAP_ALL_ACCESS, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER,
-    MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS,
-    MapViewOfFile, MapViewOfFile3, PAGE_NOACCESS, PAGE_READWRITE, UnmapViewOfFile,
-    VIRTUAL_FREE_TYPE, VirtualAlloc2, VirtualFree, VirtualQuery,
+    CreateFileMappingW, FILE_MAP_ALL_ACCESS, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE,
+    MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION,
+    MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, MapViewOfFile3, PAGE_NOACCESS, PAGE_READWRITE,
+    UnmapViewOfFile, VIRTUAL_FREE_TYPE, VirtualAlloc2, VirtualFree, VirtualQuery,
 };
 use windows::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 
-pub(super) struct Layout {
+struct Layout {
     page_size: usize,
     capacity: usize,
     shared_memory_len: u64,
 }
 
+/// Owns a header view until it becomes part of `MappedMemory`.
+struct HeaderMapping {
+    pointer: NonNull<Header>,
+}
+
+impl HeaderMapping {
+    unsafe fn map(mapping: HANDLE, page_size: usize) -> io::Result<Self> {
+        // SAFETY: the caller provides a live mapping handle and page-sized view.
+        let pointer = unsafe { MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, page_size).Value };
+        let pointer = NonNull::new(pointer.cast()).ok_or_else(io::Error::last_os_error)?;
+        Ok(Self { pointer })
+    }
+
+    fn header(&self) -> &Header {
+        // SAFETY: this owner retains a live view containing the header.
+        unsafe { self.pointer.as_ref() }
+    }
+
+    fn into_pointer(self) -> NonNull<Header> {
+        let pointer = self.pointer;
+        std::mem::forget(self);
+        pointer
+    }
+}
+
+impl Drop for HeaderMapping {
+    fn drop(&mut self) {
+        // SAFETY: this owner still holds the exact view returned by MapViewOfFile.
+        unsafe { unmap_view(self.pointer.as_ptr().cast()) };
+    }
+}
+
+/// Owns an anonymous page-file mapping independently of any mapped views.
+pub(crate) struct SharedMemory {
+    handle: OwnedHandle,
+}
+
+impl SharedMemory {
+    fn anonymous(shared_memory_len: u64) -> io::Result<Self> {
+        // SAFETY: pagefile mapping with checked exact size and no public name.
+        let handle = owned(unsafe {
+            CreateFileMappingW(
+                windows::Win32::Foundation::INVALID_HANDLE_VALUE,
+                None,
+                PAGE_READWRITE,
+                (shared_memory_len >> 32) as u32,
+                shared_memory_len as u32,
+                windows::core::PCWSTR::null(),
+            )
+        })?;
+        Ok(Self { handle })
+    }
+
+    pub(crate) fn from_handle(handle: OwnedHandle) -> Self {
+        Self { handle }
+    }
+
+    pub(crate) fn handle(&self) -> HANDLE {
+        crate::sys::windows::raw(&self.handle)
+    }
+}
+
+impl AsRawHandle for SharedMemory {
+    fn as_raw_handle(&self) -> RawHandle {
+        self.handle.as_raw_handle()
+    }
+}
+
 impl Layout {
-    pub(super) fn for_minimum_capacity(minimum_capacity: usize) -> io::Result<Self> {
+    fn for_minimum_capacity(minimum_capacity: usize) -> io::Result<Self> {
         let (page, granularity) = system_sizes();
         let capacity = capacity_for_minimum(minimum_capacity, granularity)?;
         validate_capacity(capacity, page, granularity)?;
@@ -37,13 +105,9 @@ impl Layout {
             shared_memory_len,
         })
     }
-
-    pub(super) fn shared_memory_len(&self) -> u64 {
-        self.shared_memory_len
-    }
 }
 
-pub(super) struct MappedMemory {
+pub(crate) struct MappedMemory {
     header: NonNull<Header>,
     payload: NonNull<u8>,
     capacity: usize,
@@ -54,20 +118,11 @@ unsafe impl Send for MappedMemory {}
 unsafe impl Sync for MappedMemory {}
 
 impl MappedMemory {
-    pub(super) fn create(
-        shared_memory: &SharedMemoryObject,
-        layout: Layout,
-        consumer_claim: u64,
-    ) -> io::Result<Self> {
+    fn create(shared_memory: &SharedMemory, layout: &Layout) -> io::Result<Self> {
         // SAFETY: freshly created section and validated layout.
-        let memory = unsafe { Self::map(shared_memory.handle(), &layout)? };
+        let memory = unsafe { Self::map(shared_memory.handle(), layout)? };
         // SAFETY: fresh, aligned writable header.
-        unsafe {
-            ptr::write(
-                memory.header.as_ptr(),
-                Header::new(layout.capacity, consumer_claim),
-            )
-        };
+        unsafe { ptr::write(memory.header.as_ptr(), Header::new(layout.capacity)) };
         memory
             .header()
             .version
@@ -75,57 +130,27 @@ impl MappedMemory {
         Ok(memory)
     }
 
-    pub(super) unsafe fn attach(
-        shared_memory: &SharedMemoryObject,
-        deadline: InitializationDeadline,
-    ) -> io::Result<Self> {
+    unsafe fn attach(shared_memory: &SharedMemory) -> io::Result<Self> {
         let mapping = shared_memory.handle();
         let (page, granularity) = system_sizes();
         // SAFETY: attachment contract provides a readable/writable mapping.
-        let pointer = unsafe { MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, page).Value };
-        let header: NonNull<Header> =
-            NonNull::new(pointer.cast()).ok_or_else(io::Error::last_os_error)?;
+        let header = unsafe { HeaderMapping::map(mapping, page)? };
         // SAFETY: trusted attachment and one-page mapping cover Header.
-        let value = unsafe { header.as_ref() };
-        let version = match wait_for_version(value, deadline) {
-            Ok(version) => version,
-            Err(error) => {
-                // SAFETY: exact view returned above.
-                unsafe { unmap_view(pointer) };
-                return Err(error);
-            }
-        };
+        let value = header.header();
+        let version = read_version(value)?;
         if version != ABI_VERSION {
-            // SAFETY: exact view returned above.
-            unsafe { unmap_view(pointer) };
             return Err(error::unsupported_version(version));
         }
-        let capacity: usize = match value.capacity.try_into() {
-            Ok(value) => value,
-            Err(_) => {
-                // SAFETY: exact view returned above.
-                unsafe { unmap_view(pointer) };
-                return Err(error::invalid_layout("capacity exceeds usize"));
-            }
-        };
-        if let Err(error) = validate_capacity(capacity, page, granularity)
-            .and_then(|_| validate_shared_memory(mapping, page, capacity))
-        {
-            // SAFETY: exact view returned above.
-            unsafe { unmap_view(pointer) };
-            return Err(error);
-        }
+        let capacity: usize = value
+            .capacity
+            .try_into()
+            .map_err(|_| error::invalid_layout("capacity exceeds usize"))?;
+        validate_capacity(capacity, page, granularity)?;
+        validate_shared_memory(mapping, page, capacity)?;
         // SAFETY: validated section offset and capacity.
-        let payload = match unsafe { map_payload(mapping, page, capacity) } {
-            Ok(value) => value,
-            Err(error) => {
-                // SAFETY: exact view returned above.
-                unsafe { unmap_view(pointer) };
-                return Err(error);
-            }
-        };
+        let payload = unsafe { map_payload(mapping, page, capacity)? };
         Ok(Self {
-            header,
+            header: header.into_pointer(),
             payload,
             capacity,
         })
@@ -133,65 +158,41 @@ impl MappedMemory {
 
     unsafe fn map(mapping: HANDLE, layout: &Layout) -> io::Result<Self> {
         // SAFETY: valid fresh section.
-        let pointer =
-            unsafe { MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, layout.page_size).Value };
-        let header = NonNull::new(pointer.cast()).ok_or_else(io::Error::last_os_error)?;
+        let header = unsafe { HeaderMapping::map(mapping, layout.page_size)? };
         // SAFETY: validated fresh section.
-        let payload = match unsafe { map_payload(mapping, layout.page_size, layout.capacity) } {
-            Ok(value) => value,
-            Err(error) => {
-                // SAFETY: exact view returned above.
-                unsafe { unmap_view(pointer) };
-                return Err(error);
-            }
-        };
+        let payload = unsafe { map_payload(mapping, layout.page_size, layout.capacity)? };
         Ok(Self {
-            header,
+            header: header.into_pointer(),
             payload,
             capacity: layout.capacity,
         })
     }
 
-    pub(super) fn header(&self) -> &Header {
+    pub(crate) fn header(&self) -> &Header {
         // SAFETY: the mapped header remains valid for self's lifetime.
         unsafe { self.header.as_ref() }
     }
 
-    pub(super) fn payload(&self) -> *mut u8 {
+    pub(crate) fn payload(&self) -> *mut u8 {
         self.payload.as_ptr()
     }
 
-    pub(super) fn capacity(&self) -> usize {
+    pub(crate) fn capacity(&self) -> usize {
         self.capacity
     }
 }
 
-pub(super) fn create_anonymous(
-    minimum_capacity: usize,
-    consumer_claim: u64,
-) -> io::Result<(Connection, MappedMemory)> {
+pub(super) fn create(minimum_capacity: usize) -> io::Result<(SharedMemory, MappedMemory)> {
     let layout = Layout::for_minimum_capacity(minimum_capacity)?;
-    let connection = Connection::anonymous(layout.shared_memory_len())?;
-    let memory = MappedMemory::create(connection.shared_memory(), layout, consumer_claim)?;
-    Ok((connection, memory))
+    let shared_memory = SharedMemory::anonymous(layout.shared_memory_len)?;
+    let memory = MappedMemory::create(&shared_memory, &layout)?;
+    Ok((shared_memory, memory))
 }
 
-pub(super) fn bind(
-    name: &str,
-    minimum_capacity: usize,
-    consumer_claim: u64,
-) -> io::Result<(Connection, MappedMemory)> {
-    let layout = Layout::for_minimum_capacity(minimum_capacity)?;
-    let connection = Connection::bind(name, layout.shared_memory_len())?;
-    let memory = MappedMemory::create(connection.shared_memory(), layout, consumer_claim)?;
-    Ok((connection, memory))
-}
-
-pub(super) fn connect(name: &str) -> io::Result<(Connection, MappedMemory)> {
-    let (connection, deadline) = Connection::connect(name)?;
-    // SAFETY: the library opened this named object and validates its v1 layout.
-    let memory = unsafe { MappedMemory::attach(connection.shared_memory(), deadline)? };
-    Ok((connection, memory))
+pub(super) unsafe fn attach(shared_memory: &SharedMemory) -> io::Result<MappedMemory> {
+    // SAFETY: the handle arrived through the negotiated local control channel;
+    // attach validates the complete shared ABI layout.
+    unsafe { MappedMemory::attach(shared_memory) }
 }
 
 #[cfg(test)]
@@ -211,7 +212,7 @@ impl Drop for MappedMemory {
 }
 
 #[cfg(test)]
-pub(super) fn allocation_granularity() -> usize {
+fn allocation_granularity() -> usize {
     system_sizes().1
 }
 

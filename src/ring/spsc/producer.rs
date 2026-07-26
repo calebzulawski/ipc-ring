@@ -1,35 +1,23 @@
-use super::CONSUMER_FREE;
-use super::state::{used, valid_len};
+use super::state::valid_len;
+use super::{RegisteredRing, SharedRing};
 use crate::error;
-use crate::platform::MappedRing;
-use std::cell::Cell;
 use std::io;
-use std::marker::PhantomData;
 use std::slice;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
+/// The sole writer for a shared ring.
 pub struct Producer {
-    pub(super) ring: Arc<MappedRing>,
-    _not_sync: PhantomData<Cell<()>>,
+    pub(super) ring: Arc<SharedRing>,
+    /// Keeps a named ring registered for this producer's lifetime.
+    _registration: Option<Arc<RegisteredRing>>,
 }
 
 impl Producer {
-    pub(super) fn new(ring: Arc<MappedRing>) -> Self {
+    pub(crate) fn new(ring: Arc<SharedRing>, registration: Option<Arc<RegisteredRing>>) -> Self {
         Self {
             ring,
-            _not_sync: PhantomData,
+            _registration: registration,
         }
-    }
-
-    /// Creates a named ring with at least the requested payload capacity and returns
-    /// its sole producer endpoint.
-    pub fn bind(name: &str, minimum_capacity: usize) -> io::Result<Self> {
-        Ok(Self::new(Arc::new(MappedRing::bind(
-            name,
-            minimum_capacity,
-            CONSUMER_FREE,
-        )?)))
     }
 
     /// Returns the actual payload capacity in bytes.
@@ -38,10 +26,7 @@ impl Producer {
     }
 
     pub fn writable_len(&self) -> io::Result<usize> {
-        let header = self.ring.header();
-        let write = header.write_position.load(Ordering::Relaxed);
-        let read = header.read_position.load(Ordering::Acquire);
-        Ok(self.ring.capacity() - used(write, read, self.ring.capacity())?)
+        self.ring.writable_len()
     }
 
     pub fn try_reserve(&mut self, len: usize) -> io::Result<WriteGrant<'_>> {
@@ -52,24 +37,15 @@ impl Producer {
         Ok(self.grant(len))
     }
 
-    pub fn reserve(&mut self, len: usize) -> io::Result<WriteGrant<'_>> {
+    /// Waits asynchronously until `len` contiguous aliased bytes can be granted.
+    pub async fn reserve(&mut self, len: usize) -> io::Result<WriteGrant<'_>> {
         valid_len(len, self.ring.capacity())?;
-        loop {
-            if self.writable_len()? >= len {
-                return Ok(self.grant(len));
-            }
-
-            let notification = self.ring.space_notification();
-            let registration = notification.register();
-            if self.writable_len()? >= len {
-                continue;
-            }
-            registration.wait()?;
-        }
+        self.ring.wait_for_space(len).await?;
+        Ok(self.grant(len))
     }
 
     fn grant(&mut self, len: usize) -> WriteGrant<'_> {
-        let position = self.ring.header().write_position.load(Ordering::Relaxed);
+        let position = self.ring.write_position();
         let offset = (position & (self.ring.capacity() as u64 - 1)) as usize;
         WriteGrant {
             producer: self,
@@ -79,19 +55,12 @@ impl Producer {
         }
     }
 
-    fn commit(&mut self, position: u64, amount: usize) -> io::Result<()> {
-        if amount == 0 {
-            return Ok(());
-        }
-        self.ring
-            .header()
-            .write_position
-            .store(position.wrapping_add(amount as u64), Ordering::Release);
-        self.ring.data_notification().notify()?;
-        Ok(())
+    async fn commit(&mut self, position: u64, amount: usize) -> io::Result<()> {
+        self.ring.publish_data(position, amount).await
     }
 }
 
+/// A writable span whose cursor advances only when `commit` succeeds.
 pub struct WriteGrant<'a> {
     producer: &'a mut Producer,
     position: u64,
@@ -117,16 +86,10 @@ impl WriteGrant<'_> {
 
     /// Cursor publication precedes notification; if notification fails, the
     /// committed bytes are nevertheless visible.
-    pub fn commit(self, amount: usize) -> io::Result<()> {
+    pub async fn commit(self, amount: usize) -> io::Result<()> {
         if amount > self.len {
             return Err(error::invalid_length());
         }
-        self.producer.commit(self.position, amount)
-    }
-}
-
-impl Drop for WriteGrant<'_> {
-    fn drop(&mut self) {
-        // Abandoning a grant intentionally leaves the write cursor unchanged.
+        self.producer.commit(self.position, amount).await
     }
 }

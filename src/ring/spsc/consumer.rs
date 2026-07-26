@@ -1,40 +1,66 @@
-use super::state::{used, valid_len};
-use super::{CONSUMER_CLAIMED, CONSUMER_FREE};
+use super::SharedRing;
+use super::state::valid_len;
 use crate::error;
-use crate::platform::MappedRing;
-use std::cell::Cell;
 use std::io;
-use std::marker::PhantomData;
+use std::path::Path;
 use std::slice;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::time::Duration;
 
-pub struct Consumer {
-    pub(super) ring: Arc<MappedRing>,
-    _not_sync: PhantomData<Cell<()>>,
+/// Options for connecting a consumer to a registered ring.
+#[derive(Clone, Copy, Debug)]
+pub struct ConnectOptions {
+    handshake_timeout: Duration,
 }
 
-impl Consumer {
-    pub(super) fn new(ring: Arc<MappedRing>) -> Self {
+impl ConnectOptions {
+    pub const fn new() -> Self {
         Self {
-            ring,
-            _not_sync: PhantomData,
+            handshake_timeout: crate::handshake::DEFAULT_TIMEOUT,
         }
     }
 
-    /// Opens a named ring and atomically claims its sole consumer endpoint.
-    pub fn connect(name: &str) -> io::Result<Self> {
-        let ring = Arc::new(MappedRing::connect(name)?);
-        match ring.header().consumer_claim.compare_exchange(
-            CONSUMER_FREE,
-            CONSUMER_CLAIMED,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => Ok(Self::new(ring)),
-            Err(CONSUMER_CLAIMED) => Err(error::consumer_already_connected()),
-            Err(_) => Err(error::corrupt_state()),
-        }
+    /// Limits the complete connection handshake without affecting later ring waits.
+    pub const fn handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.handshake_timeout = timeout;
+        self
+    }
+
+    /// Connects to one ring port using these options.
+    pub async fn connect(
+        self,
+        path: impl AsRef<Path>,
+        port: impl Into<String>,
+    ) -> io::Result<Consumer> {
+        let path = path.as_ref().to_path_buf();
+        let port = port.into();
+        let (stream, memory) =
+            crate::handshake::connect(path, port, self.handshake_timeout).await?;
+        Ok(Consumer::new(Arc::new(SharedRing::consumer(
+            stream, memory,
+        ))))
+    }
+}
+
+impl Default for ConnectOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The sole reader for a shared ring; dropping it permits a named replacement.
+pub struct Consumer {
+    pub(super) ring: Arc<SharedRing>,
+}
+
+impl Consumer {
+    pub(super) fn new(ring: Arc<SharedRing>) -> Self {
+        Self { ring }
+    }
+
+    /// Requests `port` from the router at the supplied native socket or pipe path.
+    pub async fn connect(path: impl AsRef<Path>, port: impl Into<String>) -> io::Result<Self> {
+        ConnectOptions::new().connect(path, port).await
     }
 
     /// Returns the actual payload capacity in bytes.
@@ -43,10 +69,7 @@ impl Consumer {
     }
 
     pub fn readable_len(&self) -> io::Result<usize> {
-        let header = self.ring.header();
-        let read = header.read_position.load(Ordering::Relaxed);
-        let write = header.write_position.load(Ordering::Acquire);
-        used(write, read, self.ring.capacity())
+        self.ring.readable_len()
     }
 
     pub fn try_inspect(&mut self, len: usize) -> io::Result<ReadGrant<'_>> {
@@ -57,24 +80,15 @@ impl Consumer {
         Ok(self.grant(len))
     }
 
-    pub fn inspect(&mut self, len: usize) -> io::Result<ReadGrant<'_>> {
+    /// Waits asynchronously until `len` published bytes can be inspected.
+    pub async fn inspect(&mut self, len: usize) -> io::Result<ReadGrant<'_>> {
         valid_len(len, self.ring.capacity())?;
-        loop {
-            if self.readable_len()? >= len {
-                return Ok(self.grant(len));
-            }
-
-            let notification = self.ring.data_notification();
-            let registration = notification.register();
-            if self.readable_len()? >= len {
-                continue;
-            }
-            registration.wait()?;
-        }
+        self.ring.wait_for_data(len).await?;
+        Ok(self.grant(len))
     }
 
     fn grant(&mut self, len: usize) -> ReadGrant<'_> {
-        let position = self.ring.header().read_position.load(Ordering::Relaxed);
+        let position = self.ring.read_position();
         let offset = (position & (self.ring.capacity() as u64 - 1)) as usize;
         ReadGrant {
             consumer: self,
@@ -84,27 +98,11 @@ impl Consumer {
         }
     }
 
-    fn release(&mut self, position: u64, amount: usize) -> io::Result<()> {
-        if amount == 0 {
-            return Ok(());
-        }
-        self.ring
-            .header()
-            .read_position
-            .store(position.wrapping_add(amount as u64), Ordering::Release);
-        self.ring.space_notification().notify()?;
-        Ok(())
+    async fn release(&mut self, position: u64, amount: usize) -> io::Result<()> {
+        self.ring.release_space(position, amount).await
     }
 }
-impl Drop for Consumer {
-    fn drop(&mut self) {
-        self.ring
-            .header()
-            .consumer_claim
-            .store(CONSUMER_FREE, Ordering::Release);
-    }
-}
-
+/// A readable span whose cursor advances only when `release` succeeds.
 pub struct ReadGrant<'a> {
     consumer: &'a mut Consumer,
     position: u64,
@@ -128,16 +126,10 @@ impl ReadGrant<'_> {
 
     /// Cursor publication precedes notification; if notification fails, the
     /// released bytes have nevertheless been reclaimed.
-    pub fn release(self, amount: usize) -> io::Result<()> {
+    pub async fn release(self, amount: usize) -> io::Result<()> {
         if amount > self.len {
             return Err(error::invalid_length());
         }
-        self.consumer.release(self.position, amount)
-    }
-}
-
-impl Drop for ReadGrant<'_> {
-    fn drop(&mut self) {
-        // Abandoning a grant intentionally leaves the read cursor unchanged.
+        self.consumer.release(self.position, amount).await
     }
 }

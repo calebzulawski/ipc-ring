@@ -1,23 +1,92 @@
-use super::{capacity_for_minimum, wait_for_version};
+use super::{capacity_for_minimum, read_version};
 use crate::error;
-use crate::platform::connection::{Connection, InitializationDeadline, SharedMemoryObject};
 use crate::ring::spsc::{ABI_VERSION, Header};
 use std::ffi::c_void;
 use std::io;
 use std::mem::size_of;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::ptr::{self, NonNull};
 use std::sync::atomic::Ordering;
 
-pub(super) struct Layout {
+struct Layout {
     page_size: usize,
     capacity: usize,
     shared_memory_len: u64,
 }
 
+/// Owns a header mapping until it becomes part of `MappedMemory`.
+struct HeaderMapping {
+    pointer: NonNull<Header>,
+    page_size: usize,
+}
+
+impl HeaderMapping {
+    fn map(fd: &OwnedFd, page_size: usize) -> io::Result<Self> {
+        let pointer = mmap_shared(ptr::null_mut(), page_size, fd, 0, false)?;
+        let pointer = NonNull::new(pointer.cast())
+            .ok_or_else(|| error::platform_invariant("null header mapping"))?;
+        Ok(Self { pointer, page_size })
+    }
+
+    fn header(&self) -> &Header {
+        // SAFETY: this owner retains a live page containing the header.
+        unsafe { self.pointer.as_ref() }
+    }
+
+    fn into_pointer(self) -> NonNull<Header> {
+        let pointer = self.pointer;
+        std::mem::forget(self);
+        pointer
+    }
+}
+
+impl Drop for HeaderMapping {
+    fn drop(&mut self) {
+        // SAFETY: this owner still holds the exact mapping returned by mmap.
+        let _ = unsafe { rustix::mm::munmap(self.pointer.as_ptr().cast(), self.page_size) };
+    }
+}
+
+/// Owns an anonymous shared-memory object independently of any mapped views.
+pub(crate) struct SharedMemory {
+    descriptor: OwnedFd,
+}
+
+impl SharedMemory {
+    fn anonymous(shared_memory_len: u64) -> io::Result<Self> {
+        let descriptor = shm_open_anonymous::shm_open_anonymous();
+        if descriptor == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: shm_open_anonymous returned a new, owned descriptor.
+        let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+        rustix::fs::ftruncate(&descriptor, shared_memory_len).map_err(io::Error::from)?;
+        Ok(Self { descriptor })
+    }
+
+    pub(crate) fn from_handle(descriptor: OwnedFd) -> Self {
+        Self { descriptor }
+    }
+
+    fn descriptor(&self) -> &OwnedFd {
+        &self.descriptor
+    }
+
+    #[cfg(test)]
+    pub(crate) fn duplicate_descriptor(&self) -> io::Result<OwnedFd> {
+        rustix::io::fcntl_dupfd_cloexec(&self.descriptor, 0).map_err(Into::into)
+    }
+}
+
+impl AsFd for SharedMemory {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.descriptor.as_fd()
+    }
+}
+
 impl Layout {
     fn for_minimum_capacity(minimum_capacity: usize) -> io::Result<Self> {
-        let page = page_size()?;
+        let page = page_size();
         let capacity = capacity_for_minimum(minimum_capacity, page)?;
         validate_capacity(capacity, page)?;
         let shared_memory_len = page
@@ -33,7 +102,7 @@ impl Layout {
     }
 }
 
-pub(super) struct MappedMemory {
+pub(crate) struct MappedMemory {
     header: NonNull<Header>,
     payload: NonNull<u8>,
     page_size: usize,
@@ -45,21 +114,12 @@ unsafe impl Send for MappedMemory {}
 unsafe impl Sync for MappedMemory {}
 
 impl MappedMemory {
-    pub(crate) fn create(
-        shared_memory: &SharedMemoryObject,
-        layout: Layout,
-        consumer_claim: u64,
-    ) -> io::Result<Self> {
+    fn create(shared_memory: &SharedMemory, layout: &Layout) -> io::Result<Self> {
         let fd = shared_memory.descriptor();
         // SAFETY: this freshly sized object is exclusively initialized here.
         let memory = unsafe { Self::map(fd, layout.page_size, layout.capacity)? };
         // SAFETY: header is aligned, writable, and currently private to creator.
-        unsafe {
-            ptr::write(
-                memory.header.as_ptr(),
-                Header::new(layout.capacity, consumer_claim),
-            )
-        };
+        unsafe { ptr::write(memory.header.as_ptr(), Header::new(layout.capacity)) };
         memory
             .header()
             .version
@@ -67,57 +127,29 @@ impl MappedMemory {
         Ok(memory)
     }
 
-    pub(crate) unsafe fn attach(
-        shared_memory: &SharedMemoryObject,
-        deadline: InitializationDeadline,
-    ) -> io::Result<Self> {
+    unsafe fn attach(shared_memory: &SharedMemory) -> io::Result<Self> {
         let fd = shared_memory.descriptor();
-        let page = page_size()?;
-        wait_for_header_size(fd, page, deadline)?;
-        let header = map_header(fd, page)?;
+        let page = page_size();
+        validate_header_size(fd, page)?;
+        let header = HeaderMapping::map(fd, page)?;
         // SAFETY: caller supplies a trusted attachment; a native page covers Header.
-        let value = unsafe { header.as_ref() };
-        let version = match wait_for_version(value, deadline) {
-            Ok(version) => version,
-            Err(error) => {
-                // SAFETY: exact mapping returned by map_header.
-                let _ = unsafe { rustix::mm::munmap(header.as_ptr().cast(), page) };
-                return Err(error);
-            }
-        };
+        let value = header.header();
+        let version = read_version(value)?;
         if version != ABI_VERSION {
-            // SAFETY: exact mapping returned by map_header.
-            let _ = unsafe { rustix::mm::munmap(header.as_ptr().cast(), page) };
             return Err(error::unsupported_version(version));
         }
 
-        let capacity: usize = match value.capacity.try_into() {
-            Ok(value) => value,
-            Err(_) => {
-                // SAFETY: exact mapping returned by map_header.
-                let _ = unsafe { rustix::mm::munmap(header.as_ptr().cast(), page) };
-                return Err(error::invalid_layout("capacity exceeds usize"));
-            }
-        };
-        if let Err(error) = validate_capacity(capacity, page)
-            .and_then(|_| validate_shared_memory(fd, page, capacity))
-        {
-            // SAFETY: exact mapping returned by map_header.
-            let _ = unsafe { rustix::mm::munmap(header.as_ptr().cast(), page) };
-            return Err(error);
-        }
+        let capacity: usize = value
+            .capacity
+            .try_into()
+            .map_err(|_| error::invalid_layout("capacity exceeds usize"))?;
+        validate_capacity(capacity, page)?;
+        validate_shared_memory(fd, page, capacity)?;
 
         // SAFETY: validated descriptor, offset, and capacity.
-        let payload = match unsafe { map_payload(fd, page, capacity) } {
-            Ok(value) => value,
-            Err(error) => {
-                // SAFETY: exact mapping returned by map_header.
-                let _ = unsafe { rustix::mm::munmap(header.as_ptr().cast(), page) };
-                return Err(error);
-            }
-        };
+        let payload = unsafe { map_payload(fd, page, capacity)? };
         Ok(Self {
-            header,
+            header: header.into_pointer(),
             payload,
             page_size: page,
             capacity,
@@ -126,18 +158,11 @@ impl MappedMemory {
 
     unsafe fn map(fd: &OwnedFd, page: usize, capacity: usize) -> io::Result<Self> {
         validate_shared_memory(fd, page, capacity)?;
-        let header = map_header(fd, page)?;
+        let header = HeaderMapping::map(fd, page)?;
         // SAFETY: validated descriptor, offset, and capacity.
-        let payload = match unsafe { map_payload(fd, page, capacity) } {
-            Ok(value) => value,
-            Err(error) => {
-                // SAFETY: exact mapping returned by map_header.
-                let _ = unsafe { rustix::mm::munmap(header.as_ptr().cast(), page) };
-                return Err(error);
-            }
-        };
+        let payload = unsafe { map_payload(fd, page, capacity)? };
         Ok(Self {
-            header,
+            header: header.into_pointer(),
             payload,
             page_size: page,
             capacity,
@@ -156,52 +181,24 @@ impl MappedMemory {
     pub(crate) fn capacity(&self) -> usize {
         self.capacity
     }
-
-    #[cfg(test)]
-    pub(crate) fn reinitialize_header_for_test(&self, consumer_claim: u64) {
-        // SAFETY: the test has restored the complete backing length and the
-        // creator is exclusively republishing the zeroed header.
-        unsafe {
-            ptr::write(
-                self.header.as_ptr(),
-                Header::new(self.capacity, consumer_claim),
-            )
-        };
-        self.header().version.store(ABI_VERSION, Ordering::Release);
-    }
 }
 
-pub(super) fn create_anonymous(
-    minimum_capacity: usize,
-    consumer_claim: u64,
-) -> io::Result<(Connection, MappedMemory)> {
+pub(super) fn create(minimum_capacity: usize) -> io::Result<(SharedMemory, MappedMemory)> {
     let layout = Layout::for_minimum_capacity(minimum_capacity)?;
-    let connection = Connection::anonymous(layout.shared_memory_len)?;
-    let memory = MappedMemory::create(connection.shared_memory(), layout, consumer_claim)?;
-    Ok((connection, memory))
+    let shared_memory = SharedMemory::anonymous(layout.shared_memory_len)?;
+    let memory = MappedMemory::create(&shared_memory, &layout)?;
+    Ok((shared_memory, memory))
 }
 
-pub(super) fn bind(
-    name: &str,
-    minimum_capacity: usize,
-    consumer_claim: u64,
-) -> io::Result<(Connection, MappedMemory)> {
-    let layout = Layout::for_minimum_capacity(minimum_capacity)?;
-    let connection = Connection::bind(name, layout.shared_memory_len)?;
-    let memory = MappedMemory::create(connection.shared_memory(), layout, consumer_claim)?;
-    Ok((connection, memory))
-}
-
-pub(super) fn connect(name: &str) -> io::Result<(Connection, MappedMemory)> {
-    let (connection, deadline) = Connection::connect(name)?;
-    // SAFETY: the library opened this named object and validates its v1 layout.
-    let memory = unsafe { MappedMemory::attach(connection.shared_memory(), deadline)? };
-    Ok((connection, memory))
+pub(super) unsafe fn attach(shared_memory: &SharedMemory) -> io::Result<MappedMemory> {
+    // SAFETY: the descriptor arrived through the negotiated local control channel;
+    // attach validates the complete shared ABI layout.
+    unsafe { MappedMemory::attach(shared_memory) }
 }
 
 #[cfg(test)]
 pub(super) fn minimum_capacity() -> usize {
-    page_size().expect("page size")
+    page_size()
 }
 
 impl Drop for MappedMemory {
@@ -248,32 +245,23 @@ fn validate_shared_memory(fd: &OwnedFd, page: usize, capacity: usize) -> io::Res
     Ok(())
 }
 
-fn wait_for_header_size(
-    fd: &OwnedFd,
-    page: usize,
-    deadline: InitializationDeadline,
-) -> io::Result<()> {
-    loop {
-        let stat = rustix::fs::fstat(fd).map_err(io::Error::from)?;
-        if stat.st_size < 0 {
-            return Err(error::invalid_layout(
-                "shared-memory object has a negative length",
-            ));
-        }
-        if stat.st_size as u128 >= page as u128 {
-            return Ok(());
-        }
-        deadline.wait()?;
+fn validate_header_size(fd: &OwnedFd, page: usize) -> io::Result<()> {
+    let stat = rustix::fs::fstat(fd).map_err(io::Error::from)?;
+    if stat.st_size < 0 {
+        return Err(error::invalid_layout(
+            "shared-memory object has a negative length",
+        ));
     }
+    if (stat.st_size as u128) < page as u128 {
+        return Err(error::invalid_layout(
+            "shared-memory object is shorter than its header",
+        ));
+    }
+    Ok(())
 }
 
-pub(crate) fn page_size() -> io::Result<usize> {
-    Ok(rustix::param::page_size())
-}
-
-fn map_header(fd: &OwnedFd, page: usize) -> io::Result<NonNull<Header>> {
-    let pointer = mmap_shared(ptr::null_mut(), page, fd, 0, false)?;
-    NonNull::new(pointer.cast()).ok_or_else(|| error::platform_invariant("null header mapping"))
+fn page_size() -> usize {
+    rustix::param::page_size()
 }
 
 unsafe fn map_payload(fd: &OwnedFd, offset: usize, capacity: usize) -> io::Result<NonNull<u8>> {
