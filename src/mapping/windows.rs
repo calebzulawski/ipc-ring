@@ -2,6 +2,7 @@ use super::{capacity_for_minimum, read_version};
 use crate::error;
 use crate::ring::spsc::{ABI_VERSION, Header};
 use crate::sys::windows::{owned, windows_error};
+use std::ffi::c_void;
 use std::io;
 use std::mem::size_of;
 use std::os::windows::io::{AsRawHandle, OwnedHandle, RawHandle};
@@ -22,35 +23,42 @@ struct Layout {
     shared_memory_len: u64,
 }
 
-/// Owns a header view until it becomes part of `MappedMemory`.
-struct HeaderMapping {
-    pointer: NonNull<Header>,
+/// Unmaps one Windows file-mapping view when its owner is dropped.
+struct MappedView<T>(NonNull<T>);
+
+impl<T> MappedView<T> {
+    unsafe fn from_raw(pointer: *mut c_void) -> io::Result<Self> {
+        let pointer = NonNull::new(pointer.cast()).ok_or_else(io::Error::last_os_error)?;
+        Ok(Self(pointer))
+    }
+
+    fn as_ptr(&self) -> *mut T {
+        self.0.as_ptr()
+    }
 }
 
-impl HeaderMapping {
-    unsafe fn map(mapping: HANDLE, page_size: usize) -> io::Result<Self> {
+impl MappedView<Header> {
+    unsafe fn map_header(mapping: HANDLE, page_size: usize) -> io::Result<Self> {
         // SAFETY: the caller provides a live mapping handle and page-sized view.
         let pointer = unsafe { MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, page_size).Value };
-        let pointer = NonNull::new(pointer.cast()).ok_or_else(io::Error::last_os_error)?;
-        Ok(Self { pointer })
+        // SAFETY: a successful MapViewOfFile result is a uniquely owned view.
+        unsafe { Self::from_raw(pointer) }
     }
 
     fn header(&self) -> &Header {
         // SAFETY: this owner retains a live view containing the header.
-        unsafe { self.pointer.as_ref() }
-    }
-
-    fn into_pointer(self) -> NonNull<Header> {
-        let pointer = self.pointer;
-        std::mem::forget(self);
-        pointer
+        unsafe { self.0.as_ref() }
     }
 }
 
-impl Drop for HeaderMapping {
+impl<T> Drop for MappedView<T> {
     fn drop(&mut self) {
-        // SAFETY: this owner still holds the exact view returned by MapViewOfFile.
-        unsafe { unmap_view(self.pointer.as_ptr().cast()) };
+        // SAFETY: this owner holds the base of one live file-mapping view.
+        let _ = unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: self.0.as_ptr().cast(),
+            })
+        };
     }
 }
 
@@ -108,8 +116,8 @@ impl Layout {
 }
 
 pub(crate) struct MappedMemory {
-    header: NonNull<Header>,
-    payload: NonNull<u8>,
+    header: MappedView<Header>,
+    payload: [MappedView<u8>; 2],
     capacity: usize,
 }
 
@@ -134,7 +142,7 @@ impl MappedMemory {
         let mapping = shared_memory.handle();
         let (page, granularity) = system_sizes();
         // SAFETY: attachment contract provides a readable/writable mapping.
-        let header = unsafe { HeaderMapping::map(mapping, page)? };
+        let header = unsafe { MappedView::map_header(mapping, page)? };
         // SAFETY: trusted attachment and one-page mapping cover Header.
         let value = header.header();
         let version = read_version(value)?;
@@ -150,7 +158,7 @@ impl MappedMemory {
         // SAFETY: validated section offset and capacity.
         let payload = unsafe { map_payload(mapping, page, capacity)? };
         Ok(Self {
-            header: header.into_pointer(),
+            header,
             payload,
             capacity,
         })
@@ -158,23 +166,22 @@ impl MappedMemory {
 
     unsafe fn map(mapping: HANDLE, layout: &Layout) -> io::Result<Self> {
         // SAFETY: valid fresh section.
-        let header = unsafe { HeaderMapping::map(mapping, layout.page_size)? };
+        let header = unsafe { MappedView::map_header(mapping, layout.page_size)? };
         // SAFETY: validated fresh section.
         let payload = unsafe { map_payload(mapping, layout.page_size, layout.capacity)? };
         Ok(Self {
-            header: header.into_pointer(),
+            header,
             payload,
             capacity: layout.capacity,
         })
     }
 
     pub(crate) fn header(&self) -> &Header {
-        // SAFETY: the mapped header remains valid for self's lifetime.
-        unsafe { self.header.as_ref() }
+        self.header.header()
     }
 
     pub(crate) fn payload(&self) -> *mut u8 {
-        self.payload.as_ptr()
+        self.payload[0].as_ptr()
     }
 
     pub(crate) fn capacity(&self) -> usize {
@@ -198,17 +205,6 @@ pub(super) unsafe fn attach(shared_memory: &SharedMemory) -> io::Result<MappedMe
 #[cfg(test)]
 pub(super) fn minimum_capacity() -> usize {
     allocation_granularity()
-}
-
-impl Drop for MappedMemory {
-    fn drop(&mut self) {
-        // SAFETY: exact views uniquely owned by self.
-        unsafe {
-            unmap_view(self.header.as_ptr().cast());
-            unmap_view(self.payload.as_ptr().cast());
-            unmap_view(self.payload.as_ptr().add(self.capacity).cast());
-        }
-    }
 }
 
 #[cfg(test)]
@@ -244,26 +240,24 @@ fn validate_shared_memory(mapping: HANDLE, page: usize, capacity: usize) -> io::
         .checked_add(capacity)
         .ok_or_else(|| error::invalid_layout("shared-memory object length overflows"))?;
     // SAFETY: zero length requests a view of the complete section.
-    let view = unsafe { MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, 0).Value };
-    if view.is_null() {
-        return Err(io::Error::last_os_error());
-    }
+    let view = unsafe {
+        MappedView::<c_void>::from_raw(MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, 0).Value)?
+    };
+    let address = view.as_ptr();
     // SAFETY: zeroed storage is valid for this output-only structure.
     let mut information = MEMORY_BASIC_INFORMATION::default();
     // SAFETY: the view and output buffer are valid for the stated sizes.
     let queried = unsafe {
         VirtualQuery(
-            Some(view.cast_const()),
+            Some(address.cast_const()),
             &mut information,
             size_of::<MEMORY_BASIC_INFORMATION>(),
         )
     };
-    // SAFETY: exact temporary view returned above.
-    unsafe { unmap_view(view) };
 
     if queried != size_of::<MEMORY_BASIC_INFORMATION>()
-        || information.BaseAddress != view
-        || information.AllocationBase != view
+        || information.BaseAddress != address
+        || information.AllocationBase != address
         || information.RegionSize != expected
     {
         return Err(error::invalid_layout(
@@ -284,7 +278,11 @@ fn system_sizes() -> (usize, usize) {
     )
 }
 
-unsafe fn map_payload(mapping: HANDLE, offset: usize, capacity: usize) -> io::Result<NonNull<u8>> {
+unsafe fn map_payload(
+    mapping: HANDLE,
+    offset: usize,
+    capacity: usize,
+) -> io::Result<[MappedView<u8>; 2]> {
     let total = capacity
         .checked_mul(2)
         .ok_or_else(|| error::platform_invariant("double mapping overflow"))?;
@@ -306,38 +304,41 @@ unsafe fn map_payload(mapping: HANDLE, offset: usize, capacity: usize) -> io::Re
     let split_flags = VIRTUAL_FREE_TYPE(MEM_RELEASE.0 | MEM_PRESERVE_PLACEHOLDER.0);
     if let Err(error) = unsafe { VirtualFree(base, capacity, split_flags) } {
         // SAFETY: exact placeholder reservation above.
-        let _ = unsafe { VirtualFree(base, 0, MEM_RELEASE) };
+        unsafe { release_placeholder(base) };
         return Err(windows_error(error));
     }
-    // SAFETY: replaces first placeholder with the payload section view.
-    let first = unsafe {
-        MapViewOfFile3(
-            mapping,
-            None,
-            Some(base.cast_const()),
-            offset as u64,
-            capacity,
-            MEM_REPLACE_PLACEHOLDER,
-            PAGE_READWRITE.0,
-            None,
-        )
-    };
-    if first.Value.is_null() {
-        let error = io::Error::last_os_error();
+    // SAFETY: replaces the first placeholder with the payload section view.
+    let first = unsafe { map_payload_view(mapping, base, offset, capacity) }.inspect_err(|_| {
         // SAFETY: both exact placeholders remain reserved.
         unsafe {
-            let _ = VirtualFree(base, 0, MEM_RELEASE);
-            let _ = VirtualFree(base.add(capacity), 0, MEM_RELEASE);
+            release_placeholder(base);
+            release_placeholder(base.add(capacity));
         }
-        return Err(error);
-    }
+    })?;
     // SAFETY: second address is the adjacent placeholder.
     let second_address = unsafe { base.add(capacity) };
-    let second = unsafe {
+    // SAFETY: replaces the second placeholder with the same payload section view.
+    let second = unsafe { map_payload_view(mapping, second_address, offset, capacity) }
+        .inspect_err(|_| {
+            // `first` unmaps itself; only the second placeholder remains.
+            // SAFETY: exact remaining placeholder.
+            unsafe { release_placeholder(second_address) };
+        })?;
+    Ok([first, second])
+}
+
+unsafe fn map_payload_view(
+    mapping: HANDLE,
+    address: *mut c_void,
+    offset: usize,
+    capacity: usize,
+) -> io::Result<MappedView<u8>> {
+    // SAFETY: caller provides one placeholder matching the requested view.
+    let view = unsafe {
         MapViewOfFile3(
             mapping,
             None,
-            Some(second_address.cast_const()),
+            Some(address.cast_const()),
             offset as u64,
             capacity,
             MEM_REPLACE_PLACEHOLDER,
@@ -345,20 +346,11 @@ unsafe fn map_payload(mapping: HANDLE, offset: usize, capacity: usize) -> io::Re
             None,
         )
     };
-    if second.Value.is_null() {
-        let error = io::Error::last_os_error();
-        // SAFETY: first is a mapped view and second is the remaining placeholder.
-        unsafe {
-            unmap_view(first.Value);
-            let _ = VirtualFree(second_address, 0, MEM_RELEASE);
-        }
-        return Err(error);
-    }
-    NonNull::new(first.Value.cast())
-        .ok_or_else(|| error::platform_invariant("null payload mapping"))
+    // SAFETY: a successful MapViewOfFile3 result is a uniquely owned view.
+    unsafe { MappedView::from_raw(view.Value) }
 }
 
-unsafe fn unmap_view(pointer: *mut std::ffi::c_void) {
-    // SAFETY: caller provides the base of a live mapped view.
-    let _ = unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: pointer }) };
+unsafe fn release_placeholder(address: *mut c_void) {
+    // SAFETY: caller provides the base of a live placeholder.
+    let _ = unsafe { VirtualFree(address, 0, MEM_RELEASE) };
 }

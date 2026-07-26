@@ -14,36 +14,38 @@ struct Layout {
     shared_memory_len: u64,
 }
 
-/// Owns a header mapping until it becomes part of `MappedMemory`.
-struct HeaderMapping {
-    pointer: NonNull<Header>,
-    page_size: usize,
+/// Unmaps one provisional region unless ownership moves into `MappedMemory`.
+struct MappedRegion<T> {
+    pointer: NonNull<T>,
+    len: usize,
 }
 
-impl HeaderMapping {
-    fn map(fd: &OwnedFd, page_size: usize) -> io::Result<Self> {
-        let pointer = mmap_shared(ptr::null_mut(), page_size, fd, 0, false)?;
-        let pointer = NonNull::new(pointer.cast())
-            .ok_or_else(|| error::platform_invariant("null header mapping"))?;
-        Ok(Self { pointer, page_size })
+impl<T> MappedRegion<T> {
+    unsafe fn from_mmap(pointer: *mut c_void, len: usize) -> io::Result<Self> {
+        let Some(pointer) = NonNull::new(pointer.cast()) else {
+            // SAFETY: the caller supplied the exact range returned by mmap.
+            let _ = unsafe { rustix::mm::munmap(pointer, len) };
+            return Err(error::platform_invariant("null mapping"));
+        };
+        Ok(Self { pointer, len })
     }
 
+    fn as_ptr(&self) -> *mut T {
+        self.pointer.as_ptr()
+    }
+}
+
+impl MappedRegion<Header> {
     fn header(&self) -> &Header {
         // SAFETY: this owner retains a live page containing the header.
         unsafe { self.pointer.as_ref() }
     }
-
-    fn into_pointer(self) -> NonNull<Header> {
-        let pointer = self.pointer;
-        std::mem::forget(self);
-        pointer
-    }
 }
 
-impl Drop for HeaderMapping {
+impl<T> Drop for MappedRegion<T> {
     fn drop(&mut self) {
         // SAFETY: this owner still holds the exact mapping returned by mmap.
-        let _ = unsafe { rustix::mm::munmap(self.pointer.as_ptr().cast(), self.page_size) };
+        let _ = unsafe { rustix::mm::munmap(self.pointer.as_ptr().cast(), self.len) };
     }
 }
 
@@ -88,14 +90,18 @@ impl Layout {
     fn for_minimum_capacity(minimum_capacity: usize) -> io::Result<Self> {
         let page = page_size();
         let capacity = capacity_for_minimum(minimum_capacity, page)?;
-        validate_capacity(capacity, page)?;
-        let shared_memory_len = page
+        Self::new(page, capacity)
+    }
+
+    fn new(page_size: usize, capacity: usize) -> io::Result<Self> {
+        validate_capacity(capacity, page_size)?;
+        let shared_memory_len = page_size
             .checked_add(capacity)
-            .ok_or_else(|| error::invalid_input("shared-memory object length overflows usize"))?
+            .ok_or_else(|| error::invalid_layout("shared-memory object length overflows"))?
             .try_into()
-            .map_err(|_| error::invalid_input("shared-memory object length exceeds u64"))?;
+            .map_err(|_| error::invalid_layout("shared-memory object length exceeds u64"))?;
         Ok(Self {
-            page_size: page,
+            page_size,
             capacity,
             shared_memory_len,
         })
@@ -103,9 +109,8 @@ impl Layout {
 }
 
 pub(crate) struct MappedMemory {
-    header: NonNull<Header>,
-    payload: NonNull<u8>,
-    page_size: usize,
+    header: MappedRegion<Header>,
+    payload: MappedRegion<u8>,
     capacity: usize,
 }
 
@@ -117,7 +122,7 @@ impl MappedMemory {
     fn create(shared_memory: &SharedMemory, layout: &Layout) -> io::Result<Self> {
         let fd = shared_memory.descriptor();
         // SAFETY: this freshly sized object is exclusively initialized here.
-        let memory = unsafe { Self::map(fd, layout.page_size, layout.capacity)? };
+        let memory = unsafe { Self::map(fd, layout)? };
         // SAFETY: header is aligned, writable, and currently private to creator.
         unsafe { ptr::write(memory.header.as_ptr(), Header::new(layout.capacity)) };
         memory
@@ -130,8 +135,13 @@ impl MappedMemory {
     unsafe fn attach(shared_memory: &SharedMemory) -> io::Result<Self> {
         let fd = shared_memory.descriptor();
         let page = page_size();
-        validate_header_size(fd, page)?;
-        let header = HeaderMapping::map(fd, page)?;
+        let shared_memory_len = shared_memory_len(fd)?;
+        if shared_memory_len < page as u64 {
+            return Err(error::invalid_layout(
+                "shared-memory object is shorter than its header",
+            ));
+        }
+        let header = map_header(fd, page)?;
         // SAFETY: caller supplies a trusted attachment; a native page covers Header.
         let value = header.header();
         let version = read_version(value)?;
@@ -143,35 +153,32 @@ impl MappedMemory {
             .capacity
             .try_into()
             .map_err(|_| error::invalid_layout("capacity exceeds usize"))?;
-        validate_capacity(capacity, page)?;
-        validate_shared_memory(fd, page, capacity)?;
+        let layout = Layout::new(page, capacity)?;
+        validate_shared_memory_len(shared_memory_len, &layout)?;
 
         // SAFETY: validated descriptor, offset, and capacity.
-        let payload = unsafe { map_payload(fd, page, capacity)? };
+        let payload = unsafe { map_payload(fd, &layout)? };
         Ok(Self {
-            header: header.into_pointer(),
+            header,
             payload,
-            page_size: page,
-            capacity,
+            capacity: layout.capacity,
         })
     }
 
-    unsafe fn map(fd: &OwnedFd, page: usize, capacity: usize) -> io::Result<Self> {
-        validate_shared_memory(fd, page, capacity)?;
-        let header = HeaderMapping::map(fd, page)?;
+    unsafe fn map(fd: &OwnedFd, layout: &Layout) -> io::Result<Self> {
+        validate_shared_memory_len(shared_memory_len(fd)?, layout)?;
+        let header = map_header(fd, layout.page_size)?;
         // SAFETY: validated descriptor, offset, and capacity.
-        let payload = unsafe { map_payload(fd, page, capacity)? };
+        let payload = unsafe { map_payload(fd, layout)? };
         Ok(Self {
-            header: header.into_pointer(),
+            header,
             payload,
-            page_size: page,
-            capacity,
+            capacity: layout.capacity,
         })
     }
 
     pub(crate) fn header(&self) -> &Header {
-        // SAFETY: mapping lives for self and its header was validated during attachment.
-        unsafe { self.header.as_ref() }
+        self.header.header()
     }
 
     pub(crate) fn payload(&self) -> *mut u8 {
@@ -201,16 +208,6 @@ pub(super) fn minimum_capacity() -> usize {
     page_size()
 }
 
-impl Drop for MappedMemory {
-    fn drop(&mut self) {
-        // SAFETY: these exact mappings are uniquely owned by self.
-        unsafe {
-            let _ = rustix::mm::munmap(self.header.as_ptr().cast(), self.page_size);
-            let _ = rustix::mm::munmap(self.payload.as_ptr().cast(), self.capacity * 2);
-        }
-    }
-}
-
 fn validate_capacity(capacity: usize, page: usize) -> io::Result<()> {
     if capacity == 0 || !capacity.is_power_of_two() {
         return Err(error::invalid_layout(
@@ -223,38 +220,23 @@ fn validate_capacity(capacity: usize, page: usize) -> io::Result<()> {
     if capacity as u128 > 1_u128 << 63 {
         return Err(error::invalid_layout("capacity exceeds 2^63"));
     }
-    capacity
-        .checked_mul(2)
-        .ok_or_else(|| error::invalid_layout("double mapping length overflows"))?;
     if size_of::<Header>() > page {
         return Err(error::platform_invariant("header exceeds one page"));
     }
     Ok(())
 }
 
-fn validate_shared_memory(fd: &OwnedFd, page: usize, capacity: usize) -> io::Result<()> {
+fn shared_memory_len(fd: &OwnedFd) -> io::Result<u64> {
     let stat = rustix::fs::fstat(fd).map_err(io::Error::from)?;
-    let expected = page
-        .checked_add(capacity)
-        .ok_or_else(|| error::invalid_layout("shared-memory object length overflows"))?;
-    if stat.st_size < 0 || stat.st_size as u128 != expected as u128 {
-        return Err(error::invalid_layout(
-            "shared-memory object length does not match capacity",
-        ));
-    }
-    Ok(())
+    stat.st_size
+        .try_into()
+        .map_err(|_| error::invalid_layout("shared-memory object has a negative length"))
 }
 
-fn validate_header_size(fd: &OwnedFd, page: usize) -> io::Result<()> {
-    let stat = rustix::fs::fstat(fd).map_err(io::Error::from)?;
-    if stat.st_size < 0 {
+fn validate_shared_memory_len(shared_memory_len: u64, layout: &Layout) -> io::Result<()> {
+    if shared_memory_len != layout.shared_memory_len {
         return Err(error::invalid_layout(
-            "shared-memory object has a negative length",
-        ));
-    }
-    if (stat.st_size as u128) < page as u128 {
-        return Err(error::invalid_layout(
-            "shared-memory object is shorter than its header",
+            "shared-memory object length does not match capacity",
         ));
     }
     Ok(())
@@ -264,33 +246,40 @@ fn page_size() -> usize {
     rustix::param::page_size()
 }
 
-unsafe fn map_payload(fd: &OwnedFd, offset: usize, capacity: usize) -> io::Result<NonNull<u8>> {
-    let total = capacity
+fn map_header(fd: &OwnedFd, page_size: usize) -> io::Result<MappedRegion<Header>> {
+    let pointer = mmap_shared(ptr::null_mut(), page_size, fd, 0, false)?;
+    // SAFETY: pointer and length are the exact successful mmap result.
+    unsafe { MappedRegion::from_mmap(pointer, page_size) }
+}
+
+unsafe fn map_payload(fd: &OwnedFd, layout: &Layout) -> io::Result<MappedRegion<u8>> {
+    let mapping_len = layout
+        .capacity
         .checked_mul(2)
-        .ok_or_else(|| error::platform_invariant("double mapping overflow"))?;
+        .ok_or_else(|| error::invalid_layout("double mapping length overflows"))?;
     // SAFETY: reserves a new inaccessible anonymous range.
     let base = unsafe {
         rustix::mm::mmap_anonymous(
             ptr::null_mut(),
-            total,
+            mapping_len,
             rustix::mm::ProtFlags::empty(),
             rustix::mm::MapFlags::PRIVATE,
         )
     }
     .map_err(io::Error::from)?;
-    if let Err(error) = mmap_shared(base, capacity, fd, offset, true) {
-        // SAFETY: exact reservation above.
-        let _ = unsafe { rustix::mm::munmap(base, total) };
-        return Err(error);
-    }
+    // SAFETY: base and length are the exact successful mmap result.
+    let payload: MappedRegion<u8> = unsafe { MappedRegion::from_mmap(base, mapping_len)? };
+    mmap_shared(
+        payload.as_ptr().cast(),
+        layout.capacity,
+        fd,
+        layout.page_size,
+        true,
+    )?;
     // SAFETY: second half lies within reservation.
-    let second = unsafe { base.cast::<u8>().add(capacity).cast() };
-    if let Err(error) = mmap_shared(second, capacity, fd, offset, true) {
-        // SAFETY: unmaps mapped first half and remaining reservation.
-        let _ = unsafe { rustix::mm::munmap(base, total) };
-        return Err(error);
-    }
-    NonNull::new(base.cast()).ok_or_else(|| error::platform_invariant("null payload mapping"))
+    let second = unsafe { payload.as_ptr().add(layout.capacity).cast() };
+    mmap_shared(second, layout.capacity, fd, layout.page_size, true)?;
+    Ok(payload)
 }
 
 fn mmap_shared(
@@ -322,6 +311,8 @@ fn mmap_shared(
     }
     .map_err(io::Error::from)?;
     if fixed && pointer != address {
+        // SAFETY: this unexpected mapping is still owned by this call.
+        let _ = unsafe { rustix::mm::munmap(pointer, len) };
         Err(error::platform_invariant(
             "MAP_FIXED returned another address",
         ))
