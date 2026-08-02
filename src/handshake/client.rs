@@ -10,7 +10,7 @@ pub(crate) async fn connect(
     path: PathBuf,
     port: String,
     handshake_timeout: Duration,
-) -> io::Result<(ConsumerStream, Arc<MappedMemory>)> {
+) -> io::Result<(u8, ConsumerStream, Arc<MappedMemory>)> {
     tokio::time::timeout(handshake_timeout, connect_and_attach(path, port))
         .await
         .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
@@ -19,16 +19,16 @@ pub(crate) async fn connect(
 async fn connect_and_attach(
     path: PathBuf,
     port: String,
-) -> io::Result<(ConsumerStream, Arc<MappedMemory>)> {
-    protocol::validate_port(&port)?;
+) -> io::Result<(u8, ConsumerStream, Arc<MappedMemory>)> {
     let mut stream = local_socket::connect(&path).await?;
     protocol::send_request(&mut stream, &port).await?;
-    protocol::receive_status(&mut stream).await?;
+    let reader_slot = protocol::receive_status(&mut stream).await?;
     let handle = local_socket::receive_mapping_handle(&mut stream).await?;
     let shared_memory = SharedMemory::from_handle(handle);
     // SAFETY: attach validates the complete shared layout before Ready is sent.
     let memory = Arc::new(unsafe { mapping::attach(&shared_memory)? });
     drop(shared_memory);
     protocol::send_ready(&mut stream).await?;
-    Ok((stream, memory))
+    protocol::receive_attached(&mut stream).await?;
+    Ok((reader_slot, stream, memory))
 }

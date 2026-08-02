@@ -9,7 +9,7 @@ mod windows;
 use windows as implementation;
 
 use crate::error;
-use crate::ring::spsc::Header;
+use crate::ring::Header;
 use std::io;
 use std::sync::atomic::Ordering;
 
@@ -20,7 +20,7 @@ pub(crate) fn create(minimum_capacity: usize) -> io::Result<(SharedMemory, Mappe
 }
 
 pub(crate) unsafe fn attach(shared_memory: &SharedMemory) -> io::Result<MappedMemory> {
-    // SAFETY: the caller obtained the object through a trusted local handoff.
+    // SAFETY: the caller received this object from the trusted local server.
     unsafe { implementation::attach(shared_memory) }
 }
 
@@ -29,17 +29,12 @@ pub(crate) fn minimum_capacity() -> usize {
     implementation::minimum_capacity()
 }
 
-fn capacity_for_minimum(minimum_capacity: usize, granularity: usize) -> io::Result<usize> {
-    if minimum_capacity == 0 {
-        return Err(error::invalid_input(
-            "minimum capacity must be greater than zero",
-        ));
-    }
-    if granularity == 0 || !granularity.is_power_of_two() {
-        return Err(error::platform_invariant(
-            "mapping granularity must be a nonzero power of two",
-        ));
-    }
+fn capacity_for_minimum(minimum_capacity: usize) -> io::Result<usize> {
+    let granularity = implementation::minimum_capacity();
+    assert!(
+        granularity != 0 && granularity.is_power_of_two(),
+        "mapping granularity must be a nonzero power of two"
+    );
 
     let capacity = minimum_capacity
         .max(granularity)
@@ -48,6 +43,9 @@ fn capacity_for_minimum(minimum_capacity: usize, granularity: usize) -> io::Resu
     if capacity as u128 > 1_u128 << 63 {
         return Err(error::invalid_input("capacity exceeds 2^63"));
     }
+    capacity
+        .checked_mul(2)
+        .ok_or_else(|| error::invalid_input("double-mapped capacity overflows address space"))?;
     Ok(capacity)
 }
 
@@ -62,14 +60,29 @@ fn read_version(header: &Header) -> io::Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::capacity_for_minimum;
+    use super::{capacity_for_minimum, minimum_capacity};
 
     #[test]
     fn capacity_rounding_uses_the_next_valid_power_of_two() {
-        assert!(capacity_for_minimum(0, 4096).is_err());
-        assert_eq!(capacity_for_minimum(1, 4096).unwrap(), 4096);
-        assert_eq!(capacity_for_minimum(4096, 4096).unwrap(), 4096);
-        assert_eq!(capacity_for_minimum(4097, 4096).unwrap(), 8192);
-        assert!(capacity_for_minimum(1, 6144).is_err());
+        let granularity = minimum_capacity();
+        let largest_double_mappable_power = 1_usize << (usize::BITS - 2);
+        let cases = [
+            (0, Some(granularity)),
+            (1, Some(granularity)),
+            (granularity - 1, Some(granularity)),
+            (granularity, Some(granularity)),
+            (granularity + 1, Some(granularity * 2)),
+            (granularity * 2, Some(granularity * 2)),
+            (granularity * 2 + 1, Some(granularity * 4)),
+            (
+                largest_double_mappable_power,
+                Some(largest_double_mappable_power),
+            ),
+            (largest_double_mappable_power + 1, None),
+            (usize::MAX, None),
+        ];
+        for (minimum, expected) in cases {
+            assert_eq!(capacity_for_minimum(minimum).ok(), expected);
+        }
     }
 }

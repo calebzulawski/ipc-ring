@@ -5,7 +5,6 @@ use std::time::Duration;
 mod client;
 mod protocol;
 mod server;
-mod stream_io;
 
 pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
 

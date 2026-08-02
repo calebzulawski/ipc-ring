@@ -3,7 +3,7 @@
 mod registry;
 mod run;
 
-pub use registry::{RingBuilder, Server};
+pub use registry::Server;
 pub use run::ServerOptions;
 
 pub(crate) use registry::ServerRegistry;

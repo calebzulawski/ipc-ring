@@ -24,14 +24,9 @@ pub(crate) struct HandshakeStream {
 }
 
 impl HandshakeStream {
-    /// Returns the process pinned when this server-side pipe was accepted.
-    pub(crate) fn client_process(&self) -> &OwnedHandle {
-        &self.client_process
-    }
-
-    /// Ends the mapping-transfer stage and releases the client process pin.
-    pub(crate) fn into_producer_stream(self) -> ProducerStream {
-        self.inner
+    /// Separates the connected pipe from the process pinned for handle transfer.
+    pub(crate) fn into_parts(self) -> (ProducerStream, OwnedHandle) {
+        (self.inner, self.client_process)
     }
 }
 

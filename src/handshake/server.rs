@@ -29,23 +29,24 @@ async fn route_and_attach(
     let ring = match registered_ring {
         Some(ring) => ring,
         None => {
-            protocol::send_status(&mut stream, protocol::Status::NotFound).await?;
+            protocol::send_status(&mut stream, protocol::Status::NotFound, None).await?;
             return Err(crate::error::port_not_found());
         }
     };
-    let consumer_admission = match ring.claim_consumer() {
-        Ok(consumer_admission) => consumer_admission,
+    let mut reader_claim = match ring.claim_reader() {
+        Ok(reader_claim) => reader_claim,
         Err(cause) if cause.kind() == io::ErrorKind::ResourceBusy => {
-            protocol::send_status(&mut stream, protocol::Status::Busy).await?;
+            protocol::send_status(&mut stream, protocol::Status::Busy, None).await?;
             return Err(cause);
         }
         Err(cause) => return Err(cause),
     };
 
-    protocol::send_status(&mut stream, protocol::Status::Ok).await?;
+    protocol::send_status(&mut stream, protocol::Status::Ok, Some(reader_claim.slot())).await?;
     let mut stream = local_socket::send_mapping_handle(stream, ring.shared_memory()).await?;
     protocol::receive_ready(&mut stream).await?;
-    ring.insert_notification_stream(stream, consumer_admission)
-        .await?;
+    reader_claim.activate();
+    protocol::send_attached(&mut stream).await?;
+    reader_claim.finish(stream)?;
     Ok(())
 }

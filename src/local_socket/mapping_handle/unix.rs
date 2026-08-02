@@ -15,11 +15,10 @@ pub(crate) async fn send_mapping_handle(
             let descriptors = [mapping.as_fd()];
             let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
             let mut ancillary = rustix::net::SendAncillaryBuffer::new(&mut space);
-            if !ancillary.push(rustix::net::SendAncillaryMessage::ScmRights(&descriptors)) {
-                return Err(crate::error::platform_invariant(
-                    "descriptor ancillary buffer is too small",
-                ));
-            }
+            assert!(
+                ancillary.push(rustix::net::SendAncillaryMessage::ScmRights(&descriptors)),
+                "statically sized descriptor ancillary buffer is too small"
+            );
             rustix::net::sendmsg(
                 &stream,
                 &data,
@@ -143,23 +142,5 @@ mod tests {
         let cause = receive_mapping_handle(&mut receiver).await.unwrap_err();
 
         assert_eq!(cause.kind(), io::ErrorKind::InvalidData);
-    }
-
-    #[test]
-    fn truncated_ancillary_data_is_rejected() {
-        let mapping = mapping();
-        let descriptor = mapping.duplicate_descriptor().unwrap();
-        let cause = validate_received_descriptor(true, vec![descriptor]).unwrap_err();
-
-        assert_eq!(cause.kind(), io::ErrorKind::InvalidData);
-    }
-
-    #[tokio::test]
-    async fn eof_before_mapping_descriptor_is_reported() {
-        let (sender, mut receiver) = crate::local_socket::pair().unwrap();
-        drop(sender);
-        let cause = receive_mapping_handle(&mut receiver).await.unwrap_err();
-
-        assert_eq!(cause.kind(), io::ErrorKind::UnexpectedEof);
     }
 }

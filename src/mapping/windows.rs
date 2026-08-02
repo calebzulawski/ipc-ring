@@ -1,12 +1,14 @@
 use super::{capacity_for_minimum, read_version};
 use crate::error;
-use crate::ring::spsc::{ABI_VERSION, Header};
+use crate::ring::{ABI_VERSION, Header};
 use crate::sys::windows::{owned, windows_error};
+use scopeguard::ScopeGuard;
 use std::ffi::c_void;
 use std::io;
 use std::mem::size_of;
 use std::os::windows::io::{AsRawHandle, OwnedHandle, RawHandle};
 use std::ptr::{self, NonNull};
+use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Memory::{
@@ -101,7 +103,7 @@ impl AsRawHandle for SharedMemory {
 impl Layout {
     fn for_minimum_capacity(minimum_capacity: usize) -> io::Result<Self> {
         let (page, granularity) = system_sizes();
-        let capacity = capacity_for_minimum(minimum_capacity, granularity)?;
+        let capacity = capacity_for_minimum(minimum_capacity)?;
         validate_capacity(capacity, page, granularity)?;
         let shared_memory_len = page
             .checked_add(capacity)
@@ -202,12 +204,10 @@ pub(super) unsafe fn attach(shared_memory: &SharedMemory) -> io::Result<MappedMe
     unsafe { MappedMemory::attach(shared_memory) }
 }
 
-#[cfg(test)]
 pub(super) fn minimum_capacity() -> usize {
     allocation_granularity()
 }
 
-#[cfg(test)]
 fn allocation_granularity() -> usize {
     system_sizes().1
 }
@@ -229,9 +229,10 @@ fn validate_capacity(capacity: usize, page: usize, granularity: usize) -> io::Re
     capacity
         .checked_mul(2)
         .ok_or_else(|| error::invalid_layout("double mapping overflow"))?;
-    if size_of::<Header>() > page {
-        return Err(error::platform_invariant("header exceeds one page"));
-    }
+    assert!(
+        size_of::<Header>() <= page,
+        "IPC ring header must fit in one mapping page"
+    );
     Ok(())
 }
 
@@ -258,24 +259,27 @@ fn validate_shared_memory(mapping: HANDLE, page: usize, capacity: usize) -> io::
     if queried != size_of::<MEMORY_BASIC_INFORMATION>()
         || information.BaseAddress != address
         || information.AllocationBase != address
-        || information.RegionSize != expected
+        || information.RegionSize < expected
     {
         return Err(error::invalid_layout(
-            "shared-memory object length does not match capacity",
+            "shared-memory object is shorter than its declared capacity",
         ));
     }
     Ok(())
 }
 
 fn system_sizes() -> (usize, usize) {
-    // SAFETY: zeroed structure is valid output storage.
-    let mut information = SYSTEM_INFO::default();
-    // SAFETY: valid output pointer.
-    unsafe { GetSystemInfo(&mut information) };
-    (
-        information.dwPageSize as usize,
-        information.dwAllocationGranularity as usize,
-    )
+    static SYSTEM_SIZES: OnceLock<(usize, usize)> = OnceLock::new();
+    *SYSTEM_SIZES.get_or_init(|| {
+        // SAFETY: zeroed structure is valid output storage.
+        let mut information = SYSTEM_INFO::default();
+        // SAFETY: valid output pointer.
+        unsafe { GetSystemInfo(&mut information) };
+        (
+            information.dwPageSize as usize,
+            information.dwAllocationGranularity as usize,
+        )
+    })
 }
 
 unsafe fn map_payload(
@@ -300,30 +304,32 @@ unsafe fn map_payload(
     if base.is_null() {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: splits the placeholder exactly in half.
+    let reservation = scopeguard::guard(base, |address| {
+        // SAFETY: the guard owns the exact placeholder reservation above.
+        unsafe { release_placeholder(address) };
+    });
+    // SAFETY: splits the guarded placeholder exactly in half.
     let split_flags = VIRTUAL_FREE_TYPE(MEM_RELEASE.0 | MEM_PRESERVE_PLACEHOLDER.0);
-    if let Err(error) = unsafe { VirtualFree(base, capacity, split_flags) } {
-        // SAFETY: exact placeholder reservation above.
-        unsafe { release_placeholder(base) };
-        return Err(windows_error(error));
-    }
-    // SAFETY: replaces the first placeholder with the payload section view.
-    let first = unsafe { map_payload_view(mapping, base, offset, capacity) }.inspect_err(|_| {
-        // SAFETY: both exact placeholders remain reserved.
-        unsafe {
-            release_placeholder(base);
-            release_placeholder(base.add(capacity));
-        }
-    })?;
-    // SAFETY: second address is the adjacent placeholder.
+    unsafe { VirtualFree(*reservation, capacity, split_flags) }.map_err(windows_error)?;
+    let base = ScopeGuard::into_inner(reservation);
+
+    // SAFETY: second address is the adjacent placeholder created by the split.
     let second_address = unsafe { base.add(capacity) };
+    let first_placeholder = scopeguard::guard(base, |address| {
+        // SAFETY: the guard owns the exact first placeholder.
+        unsafe { release_placeholder(address) };
+    });
+    let second_placeholder = scopeguard::guard(second_address, |address| {
+        // SAFETY: the guard owns the exact second placeholder.
+        unsafe { release_placeholder(address) };
+    });
+
+    // SAFETY: replaces the first placeholder with the payload section view.
+    let first = unsafe { map_payload_view(mapping, *first_placeholder, offset, capacity) }?;
+    let _ = ScopeGuard::into_inner(first_placeholder);
     // SAFETY: replaces the second placeholder with the same payload section view.
-    let second = unsafe { map_payload_view(mapping, second_address, offset, capacity) }
-        .inspect_err(|_| {
-            // `first` unmaps itself; only the second placeholder remains.
-            // SAFETY: exact remaining placeholder.
-            unsafe { release_placeholder(second_address) };
-        })?;
+    let second = unsafe { map_payload_view(mapping, *second_placeholder, offset, capacity) }?;
+    let _ = ScopeGuard::into_inner(second_placeholder);
     Ok([first, second])
 }
 
@@ -353,4 +359,42 @@ unsafe fn map_payload_view(
 unsafe fn release_placeholder(address: *mut c_void) {
     // SAFETY: caller provides the base of a live placeholder.
     let _ = unsafe { VirtualFree(address, 0, MEM_RELEASE) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attachment_accepts_trailing_shared_memory() {
+        let (page, granularity) = system_sizes();
+        let shared_memory = SharedMemory::anonymous((page + granularity * 2) as u64).unwrap();
+        // SAFETY: the new mapping is writable and contains at least one header page.
+        let header =
+            unsafe { MappedView::<Header>::map_header(shared_memory.handle(), page) }.unwrap();
+        // SAFETY: this mapping is freshly created and exclusively initialized here.
+        unsafe { ptr::write(header.as_ptr(), Header::new(granularity)) };
+        header
+            .header()
+            .version
+            .store(ABI_VERSION, Ordering::Release);
+        drop(header);
+
+        // SAFETY: the test supplies the initialized mapping above.
+        let attached = unsafe { attach(&shared_memory) }.unwrap();
+        assert_eq!(attached.capacity(), granularity);
+    }
+
+    #[test]
+    fn payload_views_are_adjacent_aliases() {
+        let (_shared_memory, memory) = create(minimum_capacity()).unwrap();
+        let first = memory.payload[0].as_ptr();
+        let second = memory.payload[1].as_ptr();
+
+        // SAFETY: both views are live, writable, and exactly one capacity apart.
+        assert_eq!(second, unsafe { first.add(memory.capacity()) });
+        // SAFETY: the views map the same initialized shared-memory payload byte.
+        unsafe { first.write(0x5a) };
+        assert_eq!(unsafe { second.read() }, 0x5a);
+    }
 }

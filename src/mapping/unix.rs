@@ -1,11 +1,12 @@
 use super::{capacity_for_minimum, read_version};
 use crate::error;
-use crate::ring::spsc::{ABI_VERSION, Header};
+use crate::ring::{ABI_VERSION, Header};
 use std::ffi::c_void;
 use std::io;
 use std::mem::size_of;
 use std::os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::ptr::{self, NonNull};
+use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 
 struct Layout {
@@ -89,7 +90,7 @@ impl AsFd for SharedMemory {
 impl Layout {
     fn for_minimum_capacity(minimum_capacity: usize) -> io::Result<Self> {
         let page = page_size();
-        let capacity = capacity_for_minimum(minimum_capacity, page)?;
+        let capacity = capacity_for_minimum(minimum_capacity)?;
         Self::new(page, capacity)
     }
 
@@ -203,7 +204,6 @@ pub(super) unsafe fn attach(shared_memory: &SharedMemory) -> io::Result<MappedMe
     unsafe { MappedMemory::attach(shared_memory) }
 }
 
-#[cfg(test)]
 pub(super) fn minimum_capacity() -> usize {
     page_size()
 }
@@ -220,9 +220,10 @@ fn validate_capacity(capacity: usize, page: usize) -> io::Result<()> {
     if capacity as u128 > 1_u128 << 63 {
         return Err(error::invalid_layout("capacity exceeds 2^63"));
     }
-    if size_of::<Header>() > page {
-        return Err(error::platform_invariant("header exceeds one page"));
-    }
+    assert!(
+        size_of::<Header>() <= page,
+        "IPC ring header must fit in one mapping page"
+    );
     Ok(())
 }
 
@@ -234,16 +235,17 @@ fn shared_memory_len(fd: &OwnedFd) -> io::Result<u64> {
 }
 
 fn validate_shared_memory_len(shared_memory_len: u64, layout: &Layout) -> io::Result<()> {
-    if shared_memory_len != layout.shared_memory_len {
+    if shared_memory_len < layout.shared_memory_len {
         return Err(error::invalid_layout(
-            "shared-memory object length does not match capacity",
+            "shared-memory object is shorter than its declared capacity",
         ));
     }
     Ok(())
 }
 
 fn page_size() -> usize {
-    rustix::param::page_size()
+    static PAGE_SIZE: OnceLock<usize> = OnceLock::new();
+    *PAGE_SIZE.get_or_init(rustix::param::page_size)
 }
 
 fn map_header(fd: &OwnedFd, page_size: usize) -> io::Result<MappedRegion<Header>> {
@@ -318,5 +320,21 @@ fn mmap_shared(
         ))
     } else {
         Ok(pointer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attachment_accepts_trailing_shared_memory() {
+        let (shared_memory, memory) = create(minimum_capacity()).unwrap();
+        let expanded = shared_memory_len(shared_memory.descriptor()).unwrap() + page_size() as u64;
+        rustix::fs::ftruncate(shared_memory.descriptor(), expanded).unwrap();
+
+        // SAFETY: the test supplies the mapping created and initialized above.
+        let attached = unsafe { attach(&shared_memory) }.unwrap();
+        assert_eq!(attached.capacity(), memory.capacity());
     }
 }

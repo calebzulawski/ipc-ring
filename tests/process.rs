@@ -1,5 +1,5 @@
 use ipc_ring::Server;
-use ipc_ring::spsc::Consumer;
+use ipc_ring::ring::Consumer;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -47,44 +47,58 @@ fn child_mode() -> Option<(String, PathBuf)> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cross_process_named_connection_and_wake() {
+async fn cross_process_fanout_reaches_two_readers() {
     if let Some((mode, endpoint)) = child_mode() {
-        if mode != "read" {
+        if mode != "fanout" {
             return;
         }
         let mut consumer = Consumer::connect(&endpoint, PORT).await.unwrap();
         let grant = consumer.inspect(5).await.unwrap();
         assert_eq!(grant.as_slice(), b"hello");
-        grant.release(5).await.unwrap();
+        grant.release(5).unwrap();
         return;
     }
 
-    let endpoint = Endpoint::new("wake");
+    let endpoint = Endpoint::new("fanout");
     let (server, task) = Server::bind(endpoint.path()).unwrap();
-    let mut producer = server.register(PORT).spsc(64 * 1024).unwrap();
+    let mut producer = server.register(PORT, 64 * 1024).unwrap();
     let router = tokio::spawn(task);
     let capacity = producer.capacity();
-    let mut child = Command::new(env::current_exe().unwrap())
-        .arg("--exact")
-        .arg("cross_process_named_connection_and_wake")
-        .arg("--nocapture")
-        .env(MODE, "read")
-        .env(ENDPOINT, endpoint.path())
-        .spawn()
-        .unwrap();
+    let spawn_reader = || {
+        Command::new(env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("cross_process_fanout_reaches_two_readers")
+            .arg("--nocapture")
+            .env(MODE, "fanout")
+            .env(ENDPOINT, endpoint.path())
+            .spawn()
+            .unwrap()
+    };
+    let mut first = spawn_reader();
+    let mut second = spawn_reader();
 
-    let mut grant = producer.reserve(5).await.unwrap();
-    grant.as_mut_slice().copy_from_slice(b"hello");
-    grant.commit(5).await.unwrap();
-
-    let status = child.wait().unwrap();
-    assert!(status.success(), "peer process failed: {status}");
+    loop {
+        let first_done = first.try_wait().unwrap().is_some();
+        let second_done = second.try_wait().unwrap().is_some();
+        if first_done && second_done {
+            break;
+        }
+        let mut grant = producer.reserve(5).await.unwrap();
+        grant.as_mut_slice().copy_from_slice(b"hello");
+        grant.commit(5).unwrap();
+        tokio::task::yield_now().await;
+    }
+    for child in [&mut first, &mut second] {
+        let status = child.wait().unwrap();
+        assert!(status.success(), "peer process failed: {status}");
+    }
+    producer.reserve(capacity).await.unwrap().commit(0).unwrap();
     assert_eq!(producer.writable_len().unwrap(), capacity);
     router.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn crashed_consumer_is_detected_and_can_be_replaced() {
+async fn crashed_consumer_is_removed_without_requiring_a_replacement() {
     if let Some((mode, endpoint)) = child_mode() {
         if mode != "crash" {
             return;
@@ -95,11 +109,11 @@ async fn crashed_consumer_is_detected_and_can_be_replaced() {
 
     let endpoint = Endpoint::new("crash");
     let (server, task) = Server::bind(endpoint.path()).unwrap();
-    let mut producer = server.register(PORT).spsc(64 * 1024).unwrap();
+    let mut producer = server.register(PORT, 64 * 1024).unwrap();
     let router = tokio::spawn(task);
     let status = Command::new(env::current_exe().unwrap())
         .arg("--exact")
-        .arg("crashed_consumer_is_detected_and_can_be_replaced")
+        .arg("crashed_consumer_is_removed_without_requiring_a_replacement")
         .arg("--nocapture")
         .env(MODE, "crash")
         .env(ENDPOINT, endpoint.path())
@@ -112,15 +126,12 @@ async fn crashed_consumer_is_detected_and_can_be_replaced() {
         .await
         .unwrap()
         .commit(capacity)
-        .await
         .unwrap();
-    assert_eq!(
-        producer.reserve(1).await.err().unwrap().kind(),
-        std::io::ErrorKind::BrokenPipe
-    );
-
-    let mut replacement = Consumer::connect(endpoint.path(), PORT).await.unwrap();
-    let grant = replacement.inspect(1).await.unwrap();
-    grant.release(1).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), producer.reserve(1))
+        .await
+        .unwrap()
+        .unwrap()
+        .commit(1)
+        .unwrap();
     router.abort();
 }

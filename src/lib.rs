@@ -5,9 +5,8 @@ mod error;
 mod handshake;
 mod local_socket;
 mod mapping;
-mod ring;
+pub mod ring;
 mod server;
 mod sys;
 
-pub use ring::spsc;
-pub use server::{RingBuilder, Server, ServerOptions};
+pub use server::{Server, ServerOptions};
