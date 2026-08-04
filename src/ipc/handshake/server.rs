@@ -1,6 +1,6 @@
 use super::protocol;
-use crate::local_socket::{self, HandshakeStream};
-use crate::server::ServerRegistry;
+use crate::ipc::server::ServerRegistry;
+use crate::ipc::socket::{self, HandshakeStream};
 use std::io;
 use std::sync::Weak;
 use std::time::Duration;
@@ -43,7 +43,7 @@ async fn route_and_attach(
     };
 
     protocol::send_status(&mut stream, protocol::Status::Ok, Some(reader_claim.slot())).await?;
-    let mut stream = local_socket::send_mapping_handle(stream, ring.shared_memory()).await?;
+    let mut stream = socket::send_mapping_handle(stream, ring.shared_memory()).await?;
     protocol::receive_ready(&mut stream).await?;
     reader_claim.activate();
     protocol::send_attached(&mut stream).await?;

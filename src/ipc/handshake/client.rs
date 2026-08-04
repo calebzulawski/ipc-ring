@@ -1,5 +1,5 @@
 use super::protocol;
-use crate::local_socket::{self, ConsumerStream};
+use crate::ipc::socket::{self, ConsumerStream};
 use crate::mapping::{self, MappedMemory, SharedMemory};
 use std::io;
 use std::path::PathBuf;
@@ -20,10 +20,10 @@ async fn connect_and_attach(
     path: PathBuf,
     port: String,
 ) -> io::Result<(u8, ConsumerStream, Arc<MappedMemory>)> {
-    let mut stream = local_socket::connect(&path).await?;
+    let mut stream = socket::connect(&path).await?;
     protocol::send_request(&mut stream, &port).await?;
     let reader_slot = protocol::receive_status(&mut stream).await?;
-    let handle = local_socket::receive_mapping_handle(&mut stream).await?;
+    let handle = socket::receive_mapping_handle(&mut stream).await?;
     let shared_memory = SharedMemory::from_handle(handle);
     // SAFETY: attach validates the complete shared layout before Ready is sent.
     let memory = Arc::new(unsafe { mapping::attach(&shared_memory)? });

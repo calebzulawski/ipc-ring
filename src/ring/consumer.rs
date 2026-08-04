@@ -1,221 +1,122 @@
-//! Consumer-side cursor management, waiting, and readable grants.
+//! Consumer-side cursor management, waiting, and readable views.
 
-#[cfg(test)]
-use super::Header;
-use super::MAX_READERS;
-use super::notification::ConsumerNotification;
-use super::reader::LocalReaderGuard;
+use super::PendingView;
 use super::state::{set_waiter_bit, used, valid_len};
+use super::wake::ConsumerWake;
 use crate::error;
-use crate::local_socket::ConsumerStream;
 use crate::mapping::MappedMemory;
 use std::io;
-use std::path::Path;
 use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+pub(crate) trait ConsumerEndpoint {
+    type Notification: ConsumerWake;
 
-/// Options for connecting a consumer to a registered ring.
-#[derive(Clone, Copy, Debug)]
-pub struct ConnectOptions {
-    handshake_timeout: Duration,
+    fn memory(&self) -> &Arc<MappedMemory>;
+    fn slot(&self) -> u8;
+    fn notification(&self) -> &Self::Notification;
+    fn notification_mut(&mut self) -> &mut Self::Notification;
+    fn pending(&self) -> Option<PendingView>;
+    fn pending_mut(&mut self) -> &mut Option<PendingView>;
 }
 
-impl ConnectOptions {
-    /// Uses the crate's default timeout for the complete attachment handshake.
-    pub const fn new() -> Self {
-        Self {
-            handshake_timeout: crate::handshake::DEFAULT_TIMEOUT,
-        }
-    }
-
-    /// Limits the complete connection handshake without affecting later ring waits.
-    pub const fn handshake_timeout(mut self, timeout: Duration) -> Self {
-        self.handshake_timeout = timeout;
-        self
-    }
-
-    /// Connects to one ring port using these options.
-    pub async fn connect(
-        self,
-        path: impl AsRef<Path>,
-        port: impl Into<String>,
-    ) -> io::Result<Consumer> {
-        let path = path.as_ref().to_path_buf();
-        let port = port.into();
-        let (slot, stream, memory) =
-            crate::handshake::connect(path, port, self.handshake_timeout).await?;
-        Consumer::ipc(slot, stream, memory)
-    }
+fn read_position<C: ConsumerEndpoint>(consumer: &C) -> u64 {
+    consumer.memory().header().read_positions[consumer.slot() as usize].load(Ordering::Acquire)
 }
 
-impl Default for ConnectOptions {
-    fn default() -> Self {
-        Self::new()
-    }
+fn readable_len<C: ConsumerEndpoint>(consumer: &C) -> io::Result<usize> {
+    let read_position = read_position(consumer);
+    let write_position = consumer
+        .memory()
+        .header()
+        .write_position
+        .load(Ordering::Acquire);
+    used(write_position, read_position, consumer.memory().capacity())
 }
 
-/// One reader attached to a shared ring.
-pub struct Consumer {
-    memory: Arc<MappedMemory>,
-    slot: u8,
-    notification: ConsumerNotification,
-    /// Keeps the anonymous reader registered for this consumer's lifetime.
-    _local_reader: Option<LocalReaderGuard>,
+fn install_pending<C: ConsumerEndpoint>(consumer: &mut C, available: usize) {
+    let capacity = consumer.memory().capacity();
+    let pending = PendingView::new(read_position(consumer), available, capacity);
+    *consumer.pending_mut() = Some(pending);
 }
 
-impl Consumer {
-    /// Builds the consumer endpoint returned by a successful IPC handshake.
-    pub(crate) fn ipc(
-        slot: u8,
-        stream: ConsumerStream,
-        memory: Arc<MappedMemory>,
-    ) -> io::Result<Self> {
-        if slot as usize >= MAX_READERS {
-            return Err(crate::error::protocol("reader slot is out of range"));
+pub(crate) fn try_reserve<C: ConsumerEndpoint>(consumer: &mut C, minimum: usize) -> io::Result<()> {
+    *consumer.pending_mut() = None;
+    valid_len(minimum, consumer.memory().capacity())?;
+    let available = readable_len(consumer)?;
+    if available < minimum {
+        return Err(error::would_block());
+    }
+    install_pending(consumer, available);
+    Ok(())
+}
+
+pub(crate) async fn reserve<C: ConsumerEndpoint>(
+    consumer: &mut C,
+    minimum: usize,
+) -> io::Result<()> {
+    *consumer.pending_mut() = None;
+    valid_len(minimum, consumer.memory().capacity())?;
+    let available = wait_for_data(consumer, minimum).await?;
+    install_pending(consumer, available);
+    Ok(())
+}
+
+/// Sets this reader's waiter bit, rechecks, then sleeps if data is still short.
+async fn wait_for_data<C: ConsumerEndpoint>(consumer: &mut C, minimum: usize) -> io::Result<usize> {
+    let bit = 1_u64 << consumer.slot();
+    loop {
+        let available = readable_len(consumer)?;
+        if available >= minimum {
+            return Ok(available);
         }
-        Ok(Self {
-            memory,
-            slot,
-            notification: ConsumerNotification::ipc(stream),
-            _local_reader: None,
-        })
-    }
-
-    /// Builds slot zero of an anonymous in-process ring.
-    pub(super) fn process_local(
-        memory: Arc<MappedMemory>,
-        notification: ConsumerNotification,
-        local_reader: LocalReaderGuard,
-    ) -> Self {
-        Self {
-            memory,
-            slot: 0,
-            notification,
-            _local_reader: Some(local_reader),
+        let memory = Arc::clone(consumer.memory());
+        let _waiter_bit = set_waiter_bit(&memory.header().data_waiters, bit);
+        let available = readable_len(consumer)?;
+        if available >= minimum {
+            return Ok(available);
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn header(&self) -> &Header {
-        self.memory.header()
-    }
-
-    fn read_position(&self) -> u64 {
-        self.memory.header().read_positions[self.slot as usize].load(Ordering::Relaxed)
-    }
-
-    /// Requests `port` from the router at the supplied native socket or pipe path.
-    pub async fn connect(path: impl AsRef<Path>, port: impl Into<String>) -> io::Result<Self> {
-        ConnectOptions::new().connect(path, port).await
-    }
-
-    /// Returns the actual payload capacity in bytes.
-    pub fn capacity(&self) -> usize {
-        self.memory.capacity()
-    }
-
-    /// Returns bytes currently published to this consumer but not yet released.
-    pub fn readable_len(&self) -> io::Result<usize> {
-        let read_position = self.read_position();
-        let write_position = self.memory.header().write_position.load(Ordering::Acquire);
-        used(write_position, read_position, self.capacity())
-    }
-
-    /// Grants `len` published bytes immediately or returns `WouldBlock`.
-    pub fn try_inspect(&mut self, len: usize) -> io::Result<ReadGrant<'_>> {
-        valid_len(len, self.capacity())?;
-        if self.readable_len()? < len {
-            return Err(error::would_block());
-        }
-        Ok(self.grant(len))
-    }
-
-    /// Waits asynchronously until `len` published bytes can be inspected.
-    pub async fn inspect(&mut self, len: usize) -> io::Result<ReadGrant<'_>> {
-        valid_len(len, self.capacity())?;
-        self.wait_for_data(len).await?;
-        Ok(self.grant(len))
-    }
-
-    /// Sets this reader's waiter bit, rechecks, then sleeps if data is still short.
-    async fn wait_for_data(&mut self, minimum: usize) -> io::Result<()> {
-        let bit = 1_u64 << self.slot;
-        loop {
-            if self.readable_len()? >= minimum {
-                return Ok(());
-            }
-            let _waiter_bit = set_waiter_bit(&self.memory.header().data_waiters, bit);
-            if self.readable_len()? >= minimum {
-                return Ok(());
-            }
-            self.notification.wait_for_data().await?;
-        }
-    }
-
-    fn grant(&mut self, len: usize) -> ReadGrant<'_> {
-        let position = self.read_position();
-        let offset = (position & (self.capacity() as u64 - 1)) as usize;
-        ReadGrant {
-            consumer: self,
-            position,
-            offset,
-            len,
-        }
-    }
-
-    /// Stores the new read position before waking a producer waiting on this slot.
-    fn release_space(&self, position: u64, amount: usize) -> io::Result<()> {
-        if amount == 0 {
-            return Ok(());
-        }
-        self.memory.header().read_positions[self.slot as usize]
-            .store(position.wrapping_add(amount as u64), Ordering::Release);
-        let bit = 1_u64 << self.slot;
-        if self
-            .memory
-            .header()
-            .space_waiters
-            .fetch_and(!bit, Ordering::AcqRel)
-            & bit
-            != 0
-        {
-            self.notification.notify_space()?;
-        }
-        Ok(())
+        consumer.notification_mut().wait_for_data().await?;
     }
 }
 
-/// A readable span whose cursor advances only when `release` succeeds.
-pub struct ReadGrant<'a> {
-    consumer: &'a mut Consumer,
+pub(crate) fn view<C: ConsumerEndpoint>(consumer: &C) -> &[u8] {
+    let Some(pending) = consumer.pending() else {
+        return &[];
+    };
+    // SAFETY: the pending span is published and protected by this reader cursor.
+    unsafe { slice::from_raw_parts(consumer.memory().payload().add(pending.offset), pending.len) }
+}
+
+pub(crate) fn advance<C: ConsumerEndpoint>(consumer: &mut C, amount: usize) -> io::Result<()> {
+    let pending = consumer.pending_mut().take();
+    if amount == 0 {
+        return Ok(());
+    }
+    let Some(pending) = pending.filter(|pending| amount <= pending.len) else {
+        return Err(error::invalid_length());
+    };
+    release_space(consumer, pending.position, amount)
+}
+
+/// Stores the new read position before waking a producer waiting on this slot.
+fn release_space<C: ConsumerEndpoint>(
+    consumer: &C,
     position: u64,
-    offset: usize,
-    len: usize,
-}
-
-impl ReadGrant<'_> {
-    pub fn len(&self) -> usize {
-        self.len
+    amount: usize,
+) -> io::Result<()> {
+    consumer.memory().header().read_positions[consumer.slot() as usize]
+        .store(position.wrapping_add(amount as u64), Ordering::Release);
+    let bit = 1_u64 << consumer.slot();
+    if consumer
+        .memory()
+        .header()
+        .space_waiters
+        .fetch_and(!bit, Ordering::AcqRel)
+        & bit
+        != 0
+    {
+        consumer.notification().notify_space()?;
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    pub fn as_slice(&self) -> &[u8] {
-        // SAFETY: the unique consumer borrow owns a published double-mapped span.
-        unsafe { slice::from_raw_parts(self.consumer.memory.payload().add(self.offset), self.len) }
-    }
-
-    /// Makes the released space visible before waking the producer.
-    ///
-    /// A wakeup failure does not undo the release.
-    pub fn release(self, amount: usize) -> io::Result<()> {
-        if amount > self.len {
-            return Err(error::invalid_length());
-        }
-        self.consumer.release_space(self.position, amount)
-    }
+    Ok(())
 }

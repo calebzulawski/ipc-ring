@@ -36,7 +36,7 @@ pub(crate) fn corrupt_state() -> io::Error {
 pub(crate) fn invalid_length() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "length exceeds the ring capacity or granted span",
+        "length exceeds the ring capacity or reserved span",
     )
 }
 

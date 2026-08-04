@@ -1,7 +1,9 @@
 //! Installs and uses the socket or pipe that wakes one IPC reader.
 
-use crate::local_socket::{ConsumerStream, ProducerStream};
+use super::socket::{ConsumerStream, ProducerStream};
+use crate::ring::wake::{ConsumerWake, ProducerWake};
 use std::io;
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
@@ -34,13 +36,13 @@ impl WakeStream for ConsumerStream {
 }
 
 /// Producer-side IPC wakeup stream, which may still be in its handshake.
-pub(in crate::ring) struct ProducerIpcNotification {
+pub(crate) struct Producer {
     stream: OnceLock<Mutex<Option<ProducerStream>>>,
     state_changed: Notify,
     closed: AtomicBool,
 }
 
-impl ProducerIpcNotification {
+impl Producer {
     pub(crate) fn pending() -> Self {
         Self {
             stream: OnceLock::new(),
@@ -151,11 +153,11 @@ impl ProducerIpcNotification {
 }
 
 /// Consumer-side IPC wakeup stream, which is connected before construction.
-pub(in crate::ring) struct ConsumerIpcNotification {
+pub(crate) struct Consumer {
     stream: ConsumerStream,
 }
 
-impl ConsumerIpcNotification {
+impl Consumer {
     pub(crate) fn connected(stream: ConsumerStream) -> Self {
         Self { stream }
     }
@@ -166,6 +168,30 @@ impl ConsumerIpcNotification {
 
     pub(crate) fn try_wake(&self) -> io::Result<()> {
         try_write_wake(&self.stream)
+    }
+}
+
+impl ProducerWake for Arc<Producer> {
+    fn notify_data(&self) -> io::Result<()> {
+        self.try_wake()
+    }
+
+    async fn wait_for_space(&self) -> io::Result<()> {
+        self.wait_for_wake().await
+    }
+
+    fn close(&self) {
+        Producer::close(self);
+    }
+}
+
+impl ConsumerWake for Consumer {
+    async fn wait_for_data(&mut self) -> io::Result<()> {
+        self.wait_for_wake().await
+    }
+
+    fn notify_space(&self) -> io::Result<()> {
+        self.try_wake()
     }
 }
 
@@ -198,4 +224,5 @@ where
 }
 
 #[cfg(test)]
+#[path = "notification/tests.rs"]
 mod tests;

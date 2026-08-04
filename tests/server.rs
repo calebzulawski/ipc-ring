@@ -1,5 +1,5 @@
-use ipc_ring::ring::{ConnectOptions, Consumer, Producer};
-use ipc_ring::{Server, ServerOptions};
+use ipc_ring::ipc::{ConnectOptions, Consumer, Producer, Server, ServerOptions};
+use ipc_ring::{View, ViewMut, local};
 use std::io;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -81,6 +81,40 @@ async fn named_pair(label: &str, minimum_capacity: usize) -> (RunningServer, Pro
     (server, producer, consumer)
 }
 
+fn snapshot_len<V: View>(endpoint: &mut V) -> usize {
+    endpoint.try_reserve(0).unwrap();
+    let len = endpoint.view().len();
+    endpoint.advance(0).unwrap();
+    len
+}
+
+async fn assert_common_empty_contract<V: View>(endpoint: &mut V, available: usize) {
+    assert!(endpoint.view().is_empty());
+    endpoint.try_reserve(0).unwrap();
+    assert_eq!(endpoint.view().len(), available);
+    endpoint.advance(0).unwrap();
+    assert_eq!(
+        endpoint.advance(1).unwrap_err().kind(),
+        ErrorKind::InvalidInput
+    );
+    endpoint.reserve(0).await.unwrap();
+    assert_eq!(endpoint.view().len(), available);
+    endpoint.advance(0).unwrap();
+}
+
+#[tokio::test]
+async fn all_concrete_endpoints_share_the_view_contract() {
+    let (mut local_producer, mut local_consumer) = local::create(1).unwrap();
+    let local_capacity = local_producer.capacity();
+    assert_common_empty_contract(&mut local_producer, local_capacity).await;
+    assert_common_empty_contract(&mut local_consumer, 0).await;
+
+    let (_server, mut server_producer, mut server_consumer) = named_pair("view-contract", 1).await;
+    let server_capacity = server_producer.capacity();
+    assert_common_empty_contract(&mut server_producer, server_capacity).await;
+    assert_common_empty_contract(&mut server_consumer, 0).await;
+}
+
 #[tokio::test]
 async fn cloned_servers_register_before_and_during_listener_execution() {
     let endpoint = TestEndpoint::new("server-clones");
@@ -116,10 +150,11 @@ async fn dropping_server_facades_does_not_stop_the_listener_task() {
     drop(server);
 
     let mut consumer = Consumer::connect(&endpoint, PORT).await.unwrap();
-    let mut grant = producer.reserve(1).await.unwrap();
-    grant.as_mut_slice()[0] = b'x';
-    grant.commit(1).unwrap();
-    assert_eq!(consumer.inspect(1).await.unwrap().as_slice(), b"x");
+    producer.reserve(1).await.unwrap();
+    producer.view_mut()[0] = b'x';
+    producer.advance(1).unwrap();
+    consumer.reserve(1).await.unwrap();
+    assert_eq!(&consumer.view()[..1], b"x");
     router.abort();
 }
 
@@ -171,24 +206,24 @@ async fn discard_mapping_transfer(stream: &mut NativeStream) {
 }
 
 #[tokio::test]
-async fn committing_data_wakes_every_waiting_reader() {
+async fn publishing_data_wakes_every_waiting_reader() {
     let (server, mut producer, mut first) = named_pair("broadcast-wake", 1).await;
     let mut second = Consumer::connect(&server.endpoint, PORT).await.unwrap();
     let first_read = async {
-        let grant = first.inspect(4).await.unwrap();
-        assert_eq!(grant.as_slice(), b"wake");
-        grant.release(4).unwrap();
+        first.reserve(4).await.unwrap();
+        assert_eq!(&first.view()[..4], b"wake");
+        first.advance(4).unwrap();
     };
     let second_read = async {
-        let grant = second.inspect(4).await.unwrap();
-        assert_eq!(grant.as_slice(), b"wake");
-        grant.release(4).unwrap();
+        second.reserve(4).await.unwrap();
+        assert_eq!(&second.view()[..4], b"wake");
+        second.advance(4).unwrap();
     };
     let write = async {
         tokio::task::yield_now().await;
-        let mut grant = producer.reserve(4).await.unwrap();
-        grant.as_mut_slice().copy_from_slice(b"wake");
-        grant.commit(4).unwrap();
+        producer.reserve(4).await.unwrap();
+        producer.view_mut()[..4].copy_from_slice(b"wake");
+        producer.advance(4).unwrap();
     };
     tokio::time::timeout(Duration::from_secs(1), async {
         tokio::join!(first_read, second_read, write);
@@ -201,26 +236,28 @@ async fn committing_data_wakes_every_waiting_reader() {
 async fn readers_start_at_the_write_cursor_when_their_attachment_completes() {
     let server = RunningServer::start("future-only");
     let mut producer = server.server.register(PORT, 1).unwrap();
-    let mut grant = producer.reserve(4).await.unwrap();
-    grant.as_mut_slice().copy_from_slice(b"past");
-    grant.commit(4).unwrap();
+    producer.reserve(4).await.unwrap();
+    producer.view_mut()[..4].copy_from_slice(b"past");
+    producer.advance(4).unwrap();
 
     let mut first = Consumer::connect(&server.endpoint, PORT).await.unwrap();
     let mut second = Consumer::connect(&server.endpoint, PORT).await.unwrap();
     assert_eq!(
-        first.try_inspect(1).err().unwrap().kind(),
+        first.try_reserve(1).err().unwrap().kind(),
         ErrorKind::WouldBlock
     );
     assert_eq!(
-        second.try_inspect(1).err().unwrap().kind(),
+        second.try_reserve(1).err().unwrap().kind(),
         ErrorKind::WouldBlock
     );
 
-    let mut grant = producer.reserve(3).await.unwrap();
-    grant.as_mut_slice().copy_from_slice(b"new");
-    grant.commit(3).unwrap();
-    assert_eq!(first.inspect(3).await.unwrap().as_slice(), b"new");
-    assert_eq!(second.inspect(3).await.unwrap().as_slice(), b"new");
+    producer.reserve(3).await.unwrap();
+    producer.view_mut()[..3].copy_from_slice(b"new");
+    producer.advance(3).unwrap();
+    first.reserve(3).await.unwrap();
+    second.reserve(3).await.unwrap();
+    assert_eq!(&first.view()[..3], b"new");
+    assert_eq!(&second.view()[..3], b"new");
 }
 
 #[tokio::test]
@@ -249,24 +286,26 @@ async fn readers_receive_the_same_data_and_the_slowest_controls_space() {
     let (server, mut producer, mut first) = named_pair("fanout", 1).await;
     let mut second = Consumer::connect(&server.endpoint, PORT).await.unwrap();
     let capacity = producer.capacity();
-    let mut write = producer.reserve(capacity).await.unwrap();
-    write.as_mut_slice().fill(b'x');
-    write.commit(capacity).unwrap();
+    producer.reserve(capacity).await.unwrap();
+    producer.view_mut().fill(b'x');
+    producer.advance(capacity).unwrap();
 
-    assert_eq!(first.inspect(1).await.unwrap().as_slice(), b"x");
-    assert_eq!(second.inspect(1).await.unwrap().as_slice(), b"x");
-    first
-        .inspect(capacity)
-        .await
-        .unwrap()
-        .release(capacity)
-        .unwrap();
+    first.reserve(1).await.unwrap();
+    second.reserve(1).await.unwrap();
+    assert_eq!(first.view().len(), capacity);
+    assert_eq!(second.view().len(), capacity);
+    assert_eq!(&first.view()[..1], b"x");
+    assert_eq!(&second.view()[..1], b"x");
+    first.reserve(capacity).await.unwrap();
+    first.advance(capacity).unwrap();
     assert_eq!(
         producer.try_reserve(1).err().unwrap().kind(),
         ErrorKind::WouldBlock
     );
-    second.inspect(1).await.unwrap().release(1).unwrap();
-    producer.reserve(1).await.unwrap().commit(1).unwrap();
+    second.reserve(1).await.unwrap();
+    second.advance(1).unwrap();
+    producer.reserve(1).await.unwrap();
+    producer.advance(1).unwrap();
 }
 
 #[tokio::test]
@@ -274,41 +313,44 @@ async fn space_wait_moves_between_blocking_readers() {
     let (server, mut producer, mut first) = named_pair("space-blocker", 1).await;
     let mut second = Consumer::connect(&server.endpoint, PORT).await.unwrap();
     let capacity = producer.capacity();
-    producer
-        .reserve(capacity)
-        .await
-        .unwrap()
-        .commit(capacity)
-        .unwrap();
-    first.inspect(1).await.unwrap().release(1).unwrap();
+    producer.reserve(capacity).await.unwrap();
+    producer.advance(capacity).unwrap();
+    first.reserve(1).await.unwrap();
+    first.advance(1).unwrap();
 
     // The cached first reader has advanced, but still independently blocks a
     // two-byte reservation. The second reader is older, yet need not be the
     // one selected for the first wait.
-    let reserve = producer.reserve(2);
-    tokio::pin!(reserve);
-    tokio::select! {
-        biased;
-        _ = &mut reserve => panic!("full ring unexpectedly had space"),
-        _ = tokio::task::yield_now() => {}
-    }
+    {
+        let reserve = producer.reserve(2);
+        tokio::pin!(reserve);
+        tokio::select! {
+            biased;
+            _ = &mut reserve => panic!("full ring unexpectedly had space"),
+            _ = tokio::task::yield_now() => {}
+        }
 
-    second.inspect(1).await.unwrap().release(1).unwrap();
-    tokio::select! {
-        biased;
-        _ = &mut reserve => panic!("the unselected older reader released the producer"),
-        _ = tokio::task::yield_now() => {}
-    }
+        second.reserve(1).await.unwrap();
+        second.advance(1).unwrap();
+        tokio::select! {
+            biased;
+            _ = &mut reserve => panic!("the unselected older reader released the producer"),
+            _ = tokio::task::yield_now() => {}
+        }
 
-    first.inspect(1).await.unwrap().release(1).unwrap();
-    tokio::select! {
-        biased;
-        _ = &mut reserve => panic!("the remaining reader still blocked the reservation"),
-        _ = tokio::task::yield_now() => {}
-    }
+        first.reserve(1).await.unwrap();
+        first.advance(1).unwrap();
+        tokio::select! {
+            biased;
+            _ = &mut reserve => panic!("the remaining reader still blocked the reservation"),
+            _ = tokio::task::yield_now() => {}
+        }
 
-    second.inspect(1).await.unwrap().release(1).unwrap();
-    reserve.await.unwrap().commit(2).unwrap();
+        second.reserve(1).await.unwrap();
+        second.advance(1).unwrap();
+        reserve.await.unwrap();
+    }
+    producer.advance(2).unwrap();
 }
 
 #[tokio::test]
@@ -316,26 +358,17 @@ async fn disconnected_blocking_reader_is_removed_without_an_error() {
     let (server, mut producer, first) = named_pair("reader-eof", 1).await;
     let mut second = Consumer::connect(&server.endpoint, PORT).await.unwrap();
     let capacity = producer.capacity();
-    producer
-        .reserve(capacity)
-        .await
-        .unwrap()
-        .commit(capacity)
-        .unwrap();
-    second
-        .inspect(capacity)
-        .await
-        .unwrap()
-        .release(capacity)
-        .unwrap();
+    producer.reserve(capacity).await.unwrap();
+    producer.advance(capacity).unwrap();
+    second.reserve(capacity).await.unwrap();
+    second.advance(capacity).unwrap();
     drop(first);
 
     tokio::time::timeout(Duration::from_secs(1), producer.reserve(1))
         .await
         .unwrap()
-        .unwrap()
-        .commit(1)
         .unwrap();
+    producer.advance(1).unwrap();
 }
 
 #[tokio::test]
@@ -346,15 +379,17 @@ async fn multiple_ports_share_one_listener() {
     let mut first_consumer = Consumer::connect(&server.endpoint, "first").await.unwrap();
     let mut second_consumer = Consumer::connect(&server.endpoint, "second").await.unwrap();
 
-    let mut grant = first_producer.reserve(1).await.unwrap();
-    grant.as_mut_slice()[0] = b'a';
-    grant.commit(1).unwrap();
-    let mut grant = second_producer.reserve(1).await.unwrap();
-    grant.as_mut_slice()[0] = b'b';
-    grant.commit(1).unwrap();
+    first_producer.reserve(1).await.unwrap();
+    first_producer.view_mut()[0] = b'a';
+    first_producer.advance(1).unwrap();
+    second_producer.reserve(1).await.unwrap();
+    second_producer.view_mut()[0] = b'b';
+    second_producer.advance(1).unwrap();
 
-    assert_eq!(first_consumer.inspect(1).await.unwrap().as_slice(), b"a");
-    assert_eq!(second_consumer.inspect(1).await.unwrap().as_slice(), b"b");
+    first_consumer.reserve(1).await.unwrap();
+    second_consumer.reserve(1).await.unwrap();
+    assert_eq!(&first_consumer.view()[..1], b"a");
+    assert_eq!(&second_consumer.view()[..1], b"b");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -393,9 +428,8 @@ async fn producer_remains_live_while_readers_attach_and_drop() {
         tokio::time::timeout(Duration::from_secs(1), producer.reserve(capacity))
             .await
             .unwrap()
-            .unwrap()
-            .commit(capacity)
             .unwrap();
+        producer.advance(capacity).unwrap();
         tokio::task::yield_now().await;
     }
     churn.await.unwrap();
@@ -409,18 +443,18 @@ async fn data_waits_survive_repeated_slot_reuse() {
     for value in 0_u8..64 {
         let mut consumer = Consumer::connect(&server.endpoint, PORT).await.unwrap();
         let reader = tokio::spawn(async move {
-            let grant = tokio::time::timeout(Duration::from_secs(1), consumer.inspect(1))
+            tokio::time::timeout(Duration::from_secs(1), consumer.reserve(1))
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(grant.as_slice(), &[value]);
-            grant.release(1).unwrap();
+            assert_eq!(&consumer.view()[..1], &[value]);
+            consumer.advance(1).unwrap();
         });
         tokio::task::yield_now().await;
 
-        let mut grant = producer.reserve(1).await.unwrap();
-        grant.as_mut_slice()[0] = value;
-        grant.commit(1).unwrap();
+        producer.reserve(1).await.unwrap();
+        producer.view_mut()[0] = value;
+        producer.advance(1).unwrap();
         tokio::time::timeout(Duration::from_secs(1), reader)
             .await
             .unwrap()
@@ -471,13 +505,9 @@ async fn incomplete_handshake_does_not_backpressure_the_producer() {
     let capacity = producer.capacity();
 
     for _ in 0..3 {
-        producer
-            .reserve(capacity)
-            .await
-            .unwrap()
-            .commit(capacity)
-            .unwrap();
-        assert_eq!(producer.writable_len().unwrap(), capacity);
+        producer.reserve(capacity).await.unwrap();
+        producer.advance(capacity).unwrap();
+        assert_eq!(snapshot_len(&mut producer), capacity);
     }
     drop(incomplete);
 }
@@ -597,22 +627,20 @@ async fn producer_never_fills_before_the_first_consumer() {
     let mut producer = server.server.register(PORT, 1).unwrap();
     let capacity = producer.capacity();
     for _ in 0..3 {
-        producer
-            .reserve(capacity)
-            .await
-            .unwrap()
-            .commit(capacity)
-            .unwrap();
-        assert_eq!(producer.writable_len().unwrap(), capacity);
+        producer.reserve(capacity).await.unwrap();
+        producer.advance(capacity).unwrap();
+        assert_eq!(snapshot_len(&mut producer), capacity);
     }
 
     let mut consumer = Consumer::connect(&server.endpoint, PORT).await.unwrap();
     assert_eq!(
-        consumer.try_inspect(1).err().unwrap().kind(),
+        consumer.try_reserve(1).err().unwrap().kind(),
         ErrorKind::WouldBlock
     );
-    producer.reserve(1).await.unwrap().commit(1).unwrap();
-    consumer.inspect(1).await.unwrap().release(1).unwrap();
+    producer.reserve(1).await.unwrap();
+    producer.advance(1).unwrap();
+    consumer.reserve(1).await.unwrap();
+    consumer.advance(1).unwrap();
 }
 
 #[tokio::test]
@@ -622,16 +650,13 @@ async fn ending_listener_without_readers_keeps_the_producer_writable() {
     let capacity = producer.capacity();
     server.stop().await;
 
-    assert_eq!(producer.writable_len().unwrap(), capacity);
-    producer.try_reserve(1).unwrap().commit(1).unwrap();
-    assert_eq!(producer.writable_len().unwrap(), capacity);
-    producer
-        .reserve(capacity)
-        .await
-        .unwrap()
-        .commit(capacity)
-        .unwrap();
-    assert_eq!(producer.writable_len().unwrap(), capacity);
+    assert_eq!(snapshot_len(&mut producer), capacity);
+    producer.try_reserve(1).unwrap();
+    producer.advance(1).unwrap();
+    assert_eq!(snapshot_len(&mut producer), capacity);
+    producer.reserve(capacity).await.unwrap();
+    producer.advance(capacity).unwrap();
+    assert_eq!(snapshot_len(&mut producer), capacity);
 }
 
 #[tokio::test]
@@ -642,18 +667,16 @@ async fn ended_listener_task_rejects_registration_but_active_ring_survives() {
     let mut consumer = Consumer::connect(&server.endpoint, PORT).await.unwrap();
 
     let capacity = producer.capacity();
-    producer
-        .reserve(capacity)
-        .await
-        .unwrap()
-        .commit(capacity)
-        .unwrap();
+    producer.reserve(capacity).await.unwrap();
+    producer.advance(capacity).unwrap();
     let pending = tokio::spawn(async move {
-        producer.reserve(1).await.unwrap().commit(1).unwrap();
+        producer.reserve(1).await.unwrap();
+        producer.advance(1).unwrap();
         producer
     });
     tokio::task::yield_now().await;
-    consumer.inspect(1).await.unwrap().release(1).unwrap();
+    consumer.reserve(1).await.unwrap();
+    consumer.advance(1).unwrap();
     let mut producer = pending.await.unwrap();
 
     server.stop().await;
@@ -661,19 +684,16 @@ async fn ended_listener_task_rejects_registration_but_active_ring_survives() {
         server_access.register("later", 1).err().unwrap().kind(),
         ErrorKind::BrokenPipe
     );
-    consumer
-        .inspect(capacity)
-        .await
-        .unwrap()
-        .release(capacity)
-        .unwrap();
+    consumer.reserve(capacity).await.unwrap();
+    consumer.advance(capacity).unwrap();
     let read = async {
-        assert_eq!(consumer.inspect(2).await.unwrap().as_slice(), b"ok");
+        consumer.reserve(2).await.unwrap();
+        assert_eq!(&consumer.view()[..2], b"ok");
     };
     let write = async {
-        let mut grant = producer.reserve(2).await.unwrap();
-        grant.as_mut_slice().copy_from_slice(b"ok");
-        grant.commit(2).unwrap();
+        producer.reserve(2).await.unwrap();
+        producer.view_mut()[..2].copy_from_slice(b"ok");
+        producer.advance(2).unwrap();
     };
     tokio::join!(read, write);
 }

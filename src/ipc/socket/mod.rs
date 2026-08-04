@@ -1,4 +1,4 @@
-//! Opens Tokio local endpoints and transfers the shared-memory mapping between peers.
+//! Opens Tokio local IPC endpoints and transfers the shared-memory mapping between peers.
 //!
 //! Unix streams and listeners are exposed directly. Windows retains one handshake wrapper because
 //! mapping transfer must keep the connected client process pinned.

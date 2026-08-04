@@ -1,12 +1,16 @@
-//! Zero-copy shared-memory rings for interprocess communication.
+//! Ring buffers for in-process and interprocess communication.
+//!
+//! - Copy-free reads and writes through contiguous byte views, even across wraparound.
+//! - Attach up to 64 parallel readers to a single ring buffer.
+//! - Asynchronous waiting with slowest-consumer backpressure.
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod error;
-mod handshake;
-mod local_socket;
+pub mod ipc;
+pub mod local;
 mod mapping;
-pub mod ring;
-mod server;
+mod ring;
 mod sys;
+mod view;
 
-pub use server::{Server, ServerOptions};
+pub use view::{View, ViewMut};

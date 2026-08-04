@@ -45,8 +45,8 @@ write_position wrapping_sub read_positions[i] <= capacity
 The producer writes payload bytes before release-storing the write cursor.
 Readers acquire-load that cursor before accessing the payload, finish reading
 before release-storing their cursor, and the producer acquire-loads reader
-cursors before reuse. Grants may have lengths from zero through capacity.
-Partial commit or release advances only the supplied amount.
+cursors before reuse. Reservations may have lengths from zero through
+capacity. Partial advancement publishes or releases only the supplied prefix.
 
 ## Registration and attachment
 
@@ -109,13 +109,18 @@ The complete handshake has a one-second default deadline configurable through
 
 Each active IPC reader has one full-duplex socket or pipe used only for
 wakeups. A wakeup is one zero byte: it carries no payload and tells the receiver
-to recheck shared positions. Anonymous rings use the same cursor and bitmap
-protocol with one reader slot and two process-local Tokio notifications.
+to recheck shared positions. Local rings use the same cursor, bitmap,
+immutable-membership, and slot-admission protocol with one independent pair of
+process-local Tokio notifications per reader. `local::Consumer::try_clone`
+atomically reserves a new slot and initializes it from the source consumer's
+current read cursor. The clone therefore inherits the source's unread bytes and
+then receives future publications independently.
 
 The producer's writable length is the capacity minus the greatest buffered
 distance among active readers. A reservation succeeds only when every active
-reader leaves enough space, so the slowest active reader provides backpressure.
-When no named readers are active, the writable length is the full capacity.
+reader leaves at least the requested minimum space, so the slowest active reader
+provides backpressure. When no named readers are active, the writable length is
+the full capacity.
 
 A reader waiting for data:
 
@@ -138,8 +143,38 @@ reads that reader's stream only if still blocked. The reader release-stores its
 cursor, clears its own bit, and writes a wake byte only if the bit was set.
 
 An extra wake byte causes a harmless state check. Nonzero bytes are malformed.
-EOF and I/O failure remove that reader; healthy readers continue. Anonymous
-endpoint loss returns `BrokenPipe` because no replacement can attach. All
-waits and wakeup I/O run on the caller's Tokio runtime. The library creates no
-runtime, background thread, or persistent monitoring task, so disconnect
-detection is operation-driven.
+EOF and I/O failure remove that reader; healthy readers continue. Removing one
+local reader leaves its siblings active. After the final local reader
+disappears, producer operations return `BrokenPipe`; producer loss wakes every
+local reader with `BrokenPipe`. All waits and wakeup I/O run on the caller's
+Tokio runtime. The library creates no runtime, background thread, or persistent
+monitoring task, so disconnect detection is operation-driven.
+
+## Endpoint view API
+
+IPC and local endpoints are separate concrete types. `ipc::Producer` and
+`local::Producer` implement `View` and `ViewMut`; `ipc::Consumer` and
+`local::Consumer` implement `View`. The traits are exported at the crate root
+and use static dispatch and native async trait methods. Their returned futures
+have no `Send` guarantee, and the traits are not directly object safe.
+
+Each endpoint retains at most one pending span. A reservation argument is a
+minimum: a successful built-in reservation stores its position, aliased payload
+offset, and the full safe span observed by its successful availability check.
+`view` exposes that fixed snapshot, `view_mut` exposes it mutably for a producer,
+and either returns an empty slice when no reservation is pending. Reserving a
+minimum of zero is the nonblocking way to snapshot current availability.
+Capacity, view access, and local cloning do not change pending state.
+
+`advance` consumes the pending span. A producer advancement release-publishes
+the selected prefix before notifying waiting readers; a consumer advancement
+release-stores its read cursor before notifying the producer. Notification
+failure never rolls back either cursor. Advancing zero bytes always succeeds
+and clears pending state. A positive advancement without a sufficiently large
+pending span returns `InvalidInput`, clears pending state, and leaves the cursor
+unchanged.
+
+Starting `try_reserve` abandons any previous reservation even if the new request
+fails. Creating an async `reserve` future does not change pending state; its
+first poll abandons the old reservation. Cancelling it after that poll leaves no
+pending reservation, and the waiter's bitmap guard clears any armed waiter bit.

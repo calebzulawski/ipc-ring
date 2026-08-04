@@ -1,6 +1,7 @@
-use super::ReaderRegistry;
+use super::notification;
 use super::reader::ReaderClaim;
 use crate::mapping::{self, MappedMemory, SharedMemory};
+use crate::ring::reader::ReaderRegistry;
 use std::io;
 use std::sync::Arc;
 
@@ -8,7 +9,7 @@ use std::sync::Arc;
 pub(crate) struct RegisteredRing {
     shared_memory: SharedMemory,
     pub(super) memory: Arc<MappedMemory>,
-    pub(super) readers: Arc<ReaderRegistry>,
+    pub(super) readers: Arc<ReaderRegistry<Arc<notification::Producer>>>,
 }
 
 impl RegisteredRing {
@@ -16,7 +17,7 @@ impl RegisteredRing {
     pub(crate) fn create(minimum_capacity: usize) -> io::Result<Arc<Self>> {
         let (shared_memory, memory) = mapping::create(minimum_capacity)?;
         let memory = Arc::new(memory);
-        let readers = ReaderRegistry::named(Arc::clone(&memory));
+        let readers = ReaderRegistry::new(Arc::clone(&memory));
         Ok(Arc::new(Self {
             shared_memory,
             memory,

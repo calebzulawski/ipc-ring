@@ -1,4 +1,4 @@
-//! Routes connections from one local listener to registered shared rings.
+//! Routes local IPC connections to registered shared rings.
 
 mod registry;
 mod run;

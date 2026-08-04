@@ -1,4 +1,4 @@
-//! Implements the short routing and mapping-attachment exchange.
+//! Implements the IPC routing and mapping-attachment exchange.
 
 use std::time::Duration;
 

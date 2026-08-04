@@ -1,4 +1,6 @@
-use crate::ring::{Producer, RegisteredRing};
+use crate::ipc::Producer;
+use crate::ipc::handshake;
+use crate::ipc::registered::RegisteredRing;
 use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex, Weak};
@@ -10,7 +12,7 @@ pub struct Server {
 }
 
 impl Server {
-    /// Allocates one ring and publishes it under a case-sensitive UTF-8 port.
+    /// Creates a ring buffer named `port` with at least `minimum_capacity` bytes.
     pub fn register(
         &self,
         port: impl Into<String>,
@@ -43,7 +45,7 @@ impl ServerRegistry {
     }
 
     fn register_ring(&self, port: String, minimum_capacity: usize) -> io::Result<Producer> {
-        crate::handshake::validate_port(&port)?;
+        handshake::validate_port(&port)?;
         let mut rings_by_port = self
             .rings_by_port
             .lock()

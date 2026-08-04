@@ -1,4 +1,4 @@
-//! Transfers only the anonymous shared-memory mapping used during attachment.
+//! Transfers the shared-memory mapping used during attachment.
 
 #[cfg(unix)]
 mod unix;

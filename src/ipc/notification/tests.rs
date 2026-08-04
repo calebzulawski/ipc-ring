@@ -1,4 +1,4 @@
-use super::{ProducerIpcNotification, WakeStream, read_wake_byte, try_write_wake};
+use super::{Producer, WakeStream, read_wake_byte, try_write_wake};
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -79,8 +79,8 @@ async fn wake_byte_io_validates_zero_and_reports_eof_as_broken_pipe() {
 #[tokio::test]
 #[cfg(unix)]
 async fn installation_sends_one_reconciliation_wake() {
-    let notification = ProducerIpcNotification::pending();
-    let (mut stream, mut peer) = crate::local_socket::pair().unwrap();
+    let notification = Producer::pending();
+    let (mut stream, mut peer) = crate::ipc::socket::pair().unwrap();
     stream.write_u8(0).await.unwrap();
     assert_eq!(peer.read_u8().await.unwrap(), 0);
     notification.try_wake().unwrap();
@@ -111,7 +111,7 @@ fn wake_write_results_are_classified() {
 
 #[tokio::test]
 async fn closing_a_pending_producer_notification_wakes_its_reader() {
-    let notification = Arc::new(ProducerIpcNotification::pending());
+    let notification = Arc::new(Producer::pending());
     let read = {
         let notification = Arc::clone(&notification);
         tokio::spawn(async move { notification.wait_for_wake().await })
@@ -127,9 +127,9 @@ async fn closing_a_pending_producer_notification_wakes_its_reader() {
 #[tokio::test]
 #[cfg(unix)]
 async fn a_closed_notification_rejects_stream_installation() {
-    let notification = ProducerIpcNotification::pending();
+    let notification = Producer::pending();
     notification.close();
-    let (stream, _peer) = crate::local_socket::pair().unwrap();
+    let (stream, _peer) = crate::ipc::socket::pair().unwrap();
 
     assert_eq!(
         notification.install(stream).unwrap_err().kind(),
@@ -140,8 +140,8 @@ async fn a_closed_notification_rejects_stream_installation() {
 #[tokio::test]
 #[cfg(unix)]
 async fn closing_an_installed_producer_notification_interrupts_its_read() {
-    let notification = Arc::new(ProducerIpcNotification::pending());
-    let (stream, _peer) = crate::local_socket::pair().unwrap();
+    let notification = Arc::new(Producer::pending());
+    let (stream, _peer) = crate::ipc::socket::pair().unwrap();
     notification.install(stream).unwrap();
 
     let read = {

@@ -2,13 +2,11 @@
 
 mod registry;
 
-use super::notification::ProducerNotification;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-pub(in crate::ring) use registry::ActiveReaders;
-pub(crate) use registry::{LocalReaderGuard, ReaderClaim, ReaderRegistry};
+pub(crate) use registry::{ActiveReaders, ReaderRegistry};
 
 /// Exclusive ownership of one process-local reader slot reservation.
 struct SlotLease {
@@ -57,19 +55,19 @@ impl Drop for SlotLease {
 }
 
 /// Producer-side state for one reader slot.
-pub(super) struct ReaderConnection {
+pub(crate) struct ReaderConnection<N> {
     /// Keeps this connection's shared read-cursor index reserved.
     lease: SlotLease,
     /// Channel used to wake this reader or wait for it to release space.
-    pub(super) notification: ProducerNotification,
+    pub(crate) notification: N,
 }
 
-impl ReaderConnection {
-    pub(super) fn slot(&self) -> usize {
+impl<N> ReaderConnection<N> {
+    pub(crate) fn slot(&self) -> usize {
         self.lease.slot()
     }
 
-    pub(super) fn release_slot(&self) {
+    pub(crate) fn release_slot(&self) {
         self.lease.release();
     }
 }

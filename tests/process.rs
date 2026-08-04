@@ -1,5 +1,5 @@
-use ipc_ring::Server;
-use ipc_ring::ring::Consumer;
+use ipc_ring::ipc::{Consumer, Server};
+use ipc_ring::{View, ViewMut};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -53,9 +53,9 @@ async fn cross_process_fanout_reaches_two_readers() {
             return;
         }
         let mut consumer = Consumer::connect(&endpoint, PORT).await.unwrap();
-        let grant = consumer.inspect(5).await.unwrap();
-        assert_eq!(grant.as_slice(), b"hello");
-        grant.release(5).unwrap();
+        consumer.reserve(5).await.unwrap();
+        assert_eq!(&consumer.view()[..5], b"hello");
+        consumer.advance(5).unwrap();
         return;
     }
 
@@ -83,17 +83,20 @@ async fn cross_process_fanout_reaches_two_readers() {
         if first_done && second_done {
             break;
         }
-        let mut grant = producer.reserve(5).await.unwrap();
-        grant.as_mut_slice().copy_from_slice(b"hello");
-        grant.commit(5).unwrap();
+        producer.reserve(5).await.unwrap();
+        producer.view_mut()[..5].copy_from_slice(b"hello");
+        producer.advance(5).unwrap();
         tokio::task::yield_now().await;
     }
     for child in [&mut first, &mut second] {
         let status = child.wait().unwrap();
         assert!(status.success(), "peer process failed: {status}");
     }
-    producer.reserve(capacity).await.unwrap().commit(0).unwrap();
-    assert_eq!(producer.writable_len().unwrap(), capacity);
+    producer.reserve(capacity).await.unwrap();
+    producer.advance(0).unwrap();
+    producer.try_reserve(0).unwrap();
+    assert_eq!(producer.view().len(), capacity);
+    producer.advance(0).unwrap();
     router.abort();
 }
 
@@ -121,17 +124,12 @@ async fn crashed_consumer_is_removed_without_requiring_a_replacement() {
         .unwrap();
     assert!(!status.success(), "crashing peer unexpectedly succeeded");
     let capacity = producer.capacity();
-    producer
-        .reserve(capacity)
-        .await
-        .unwrap()
-        .commit(capacity)
-        .unwrap();
+    producer.reserve(capacity).await.unwrap();
+    producer.advance(capacity).unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(1), producer.reserve(1))
         .await
         .unwrap()
-        .unwrap()
-        .commit(1)
         .unwrap();
+    producer.advance(1).unwrap();
     router.abort();
 }

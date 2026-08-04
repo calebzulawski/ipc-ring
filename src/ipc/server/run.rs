@@ -1,5 +1,6 @@
 use super::{Server, ServerRegistry};
-use crate::local_socket::{self, Listener};
+use crate::ipc::handshake;
+use crate::ipc::socket::{self, Listener};
 use std::future::Future;
 use std::io;
 use std::path::Path;
@@ -9,26 +10,27 @@ use tokio::task::JoinSet;
 
 const MAX_CONCURRENT_HANDSHAKES: usize = 64;
 
-/// Configures listener-wide policy applied to each accepted handshake.
+/// Options for running an IPC server.
 #[derive(Clone, Copy, Debug)]
 pub struct ServerOptions {
     handshake_timeout: Duration,
 }
 
 impl ServerOptions {
+    /// Creates server options with default settings.
     pub const fn new() -> Self {
         Self {
-            handshake_timeout: crate::handshake::DEFAULT_TIMEOUT,
+            handshake_timeout: handshake::DEFAULT_TIMEOUT,
         }
     }
 
-    /// Limits each accepted client's complete handshake without affecting established rings.
+    /// Sets how long a reader may take to connect.
     pub const fn handshake_timeout(mut self, timeout: Duration) -> Self {
         self.handshake_timeout = timeout;
         self
     }
 
-    /// Binds the endpoint and returns registration access plus its listener task.
+    /// Binds a server to `path` and returns the server and the future that runs it.
     pub fn bind(
         self,
         path: impl AsRef<Path>,
@@ -36,7 +38,7 @@ impl ServerOptions {
         Server,
         impl Future<Output = io::Result<()>> + Send + 'static,
     )> {
-        let listener = local_socket::bind(path.as_ref())?;
+        let listener = socket::bind(path.as_ref())?;
         let registry = Arc::new(ServerRegistry::new());
         let server = Server {
             registry: Arc::downgrade(&registry),
@@ -53,7 +55,7 @@ impl Default for ServerOptions {
 }
 
 impl Server {
-    /// Returns registration access and the unique listener future for this path.
+    /// Binds a server with default options and returns the server and the future that runs it.
     pub fn bind(
         path: impl AsRef<Path>,
     ) -> io::Result<(Self, impl Future<Output = io::Result<()>> + Send + 'static)> {
@@ -74,18 +76,18 @@ async fn run_listener(
         }
 
         if incomplete_handshakes.is_empty() {
-            let stream = local_socket::accept(&mut listener).await?;
+            let stream = socket::accept(&mut listener).await?;
             let registry = Arc::downgrade(&registry);
             incomplete_handshakes.spawn(async move {
-                let _ = crate::handshake::route(stream, registry, handshake_timeout).await;
+                let _ = handshake::route(stream, registry, handshake_timeout).await;
             });
         } else {
             tokio::select! {
-                accepted = local_socket::accept(&mut listener) => {
+                accepted = socket::accept(&mut listener) => {
                     let stream = accepted?;
                     let registry = Arc::downgrade(&registry);
                     incomplete_handshakes.spawn(async move {
-                        let _ = crate::handshake::route(stream, registry, handshake_timeout).await;
+                        let _ = handshake::route(stream, registry, handshake_timeout).await;
                     });
                 }
                 _ = incomplete_handshakes.join_next() => {}

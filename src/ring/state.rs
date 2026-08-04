@@ -1,4 +1,4 @@
-//! Validates grant lengths and distances between wrapping shared cursors.
+//! Validates reservation lengths and distances between wrapping shared cursors.
 
 use crate::error;
 use std::io;
