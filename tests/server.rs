@@ -1,5 +1,7 @@
 use ipc_ring::ipc::{ConnectOptions, Consumer, Producer, Server, ServerOptions};
-use ipc_ring::{View, ViewMut, local};
+use ipc_ring::local;
+use ipc_ring::raw::Cursor;
+use ipc_ring::view::View;
 use std::io;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -11,11 +13,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const PORT: &str = "ring";
 
 #[derive(Clone)]
-struct TestEndpoint(Arc<EndpointPath>);
+struct TestPath(Arc<PathGuard>);
 
-struct EndpointPath(PathBuf);
+struct PathGuard(PathBuf);
 
-impl TestEndpoint {
+impl TestPath {
     fn new(label: &str) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let suffix = format!(
@@ -27,39 +29,35 @@ impl TestEndpoint {
         let path = std::env::temp_dir().join(format!("ipc-ring-{suffix}.sock"));
         #[cfg(windows)]
         let path = PathBuf::from(format!(r"\\.\pipe\ipc-ring-{suffix}"));
-        Self(Arc::new(EndpointPath(path)))
+        Self(Arc::new(PathGuard(path)))
     }
 }
 
-impl AsRef<Path> for TestEndpoint {
+impl AsRef<Path> for TestPath {
     fn as_ref(&self) -> &Path {
         &self.0.0
     }
 }
 
 #[cfg(unix)]
-impl Drop for EndpointPath {
+impl Drop for PathGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
 }
 
 struct RunningServer {
-    endpoint: TestEndpoint,
+    path: TestPath,
     server: Server,
     task: tokio::task::JoinHandle<io::Result<()>>,
 }
 
 impl RunningServer {
     fn start(label: &str) -> Self {
-        let endpoint = TestEndpoint::new(label);
-        let (server, task) = Server::bind(&endpoint).unwrap();
+        let path = TestPath::new(label);
+        let (server, task) = Server::bind(&path).unwrap();
         let task = tokio::spawn(task);
-        Self {
-            endpoint,
-            server,
-            task,
-        }
+        Self { path, server, task }
     }
 
     async fn stop(mut self) {
@@ -74,36 +72,39 @@ impl Drop for RunningServer {
     }
 }
 
-async fn named_pair(label: &str, minimum_capacity: usize) -> (RunningServer, Producer, Consumer) {
+async fn named_pair(
+    label: &str,
+    minimum_capacity: usize,
+) -> (RunningServer, View<Producer>, View<Consumer>) {
     let server = RunningServer::start(label);
     let producer = server.server.register(PORT, minimum_capacity).unwrap();
-    let consumer = Consumer::connect(&server.endpoint, PORT).await.unwrap();
+    let consumer = ConnectOptions::new()
+        .connect(&server.path, PORT)
+        .await
+        .unwrap();
     (server, producer, consumer)
 }
 
-fn snapshot_len<V: View>(endpoint: &mut V) -> usize {
-    endpoint.try_reserve(0).unwrap();
-    let len = endpoint.view().len();
-    endpoint.advance(0).unwrap();
+fn snapshot_len<C: Cursor>(view: &mut View<C>) -> usize {
+    view.try_reserve(0).unwrap();
+    let len = view.view().len();
+    view.advance(0).unwrap();
     len
 }
 
-async fn assert_common_empty_contract<V: View>(endpoint: &mut V, available: usize) {
-    assert!(endpoint.view().is_empty());
-    endpoint.try_reserve(0).unwrap();
-    assert_eq!(endpoint.view().len(), available);
-    endpoint.advance(0).unwrap();
-    assert_eq!(
-        endpoint.advance(1).unwrap_err().kind(),
-        ErrorKind::InvalidInput
-    );
-    endpoint.reserve(0).await.unwrap();
-    assert_eq!(endpoint.view().len(), available);
-    endpoint.advance(0).unwrap();
+async fn assert_common_empty_contract<C: Cursor>(view: &mut View<C>, available: usize) {
+    assert!(view.view().is_empty());
+    view.try_reserve(0).unwrap();
+    assert_eq!(view.view().len(), available);
+    view.advance(0).unwrap();
+    assert_eq!(view.advance(1).unwrap_err().kind(), ErrorKind::InvalidInput);
+    view.reserve(0).await.unwrap();
+    assert_eq!(view.view().len(), available);
+    view.advance(0).unwrap();
 }
 
 #[tokio::test]
-async fn all_concrete_endpoints_share_the_view_contract() {
+async fn all_concrete_views_share_the_same_contract() {
     let (mut local_producer, mut local_consumer) = local::create(1).unwrap();
     let local_capacity = local_producer.capacity();
     assert_common_empty_contract(&mut local_producer, local_capacity).await;
@@ -117,22 +118,25 @@ async fn all_concrete_endpoints_share_the_view_contract() {
 
 #[tokio::test]
 async fn cloned_servers_register_before_and_during_listener_execution() {
-    let endpoint = TestEndpoint::new("server-clones");
-    let (server, task) = Server::bind(&endpoint).unwrap();
+    let path = TestPath::new("server-clones");
+    let (server, task) = Server::bind(&path).unwrap();
     let _first = server.clone().register("first", 1).unwrap();
     let router = tokio::spawn(task);
     let _second = server.register("second", 1).unwrap();
 
-    let first_consumer = Consumer::connect(&endpoint, "first").await.unwrap();
-    let second_consumer = Consumer::connect(&endpoint, "second").await.unwrap();
+    let first_consumer = ConnectOptions::new().connect(&path, "first").await.unwrap();
+    let second_consumer = ConnectOptions::new()
+        .connect(&path, "second")
+        .await
+        .unwrap();
     drop((first_consumer, second_consumer));
     router.abort();
 }
 
 #[tokio::test]
 async fn dropping_an_unspawned_listener_task_closes_registration() {
-    let endpoint = TestEndpoint::new("unspawned-task");
-    let (server, task) = Server::bind(&endpoint).unwrap();
+    let path = TestPath::new("unspawned-task");
+    let (server, task) = Server::bind(&path).unwrap();
     drop(task);
 
     assert_eq!(
@@ -143,13 +147,13 @@ async fn dropping_an_unspawned_listener_task_closes_registration() {
 
 #[tokio::test]
 async fn dropping_server_facades_does_not_stop_the_listener_task() {
-    let endpoint = TestEndpoint::new("dropped-facade");
-    let (server, task) = Server::bind(&endpoint).unwrap();
+    let path = TestPath::new("dropped-facade");
+    let (server, task) = Server::bind(&path).unwrap();
     let mut producer = server.register(PORT, 1).unwrap();
     let router = tokio::spawn(task);
     drop(server);
 
-    let mut consumer = Consumer::connect(&endpoint, PORT).await.unwrap();
+    let mut consumer = ConnectOptions::new().connect(&path, PORT).await.unwrap();
     producer.reserve(1).await.unwrap();
     producer.view_mut()[0] = b'x';
     producer.advance(1).unwrap();
@@ -208,7 +212,10 @@ async fn discard_mapping_transfer(stream: &mut NativeStream) {
 #[tokio::test]
 async fn publishing_data_wakes_every_waiting_reader() {
     let (server, mut producer, mut first) = named_pair("broadcast-wake", 1).await;
-    let mut second = Consumer::connect(&server.endpoint, PORT).await.unwrap();
+    let mut second = ConnectOptions::new()
+        .connect(&server.path, PORT)
+        .await
+        .unwrap();
     let first_read = async {
         first.reserve(4).await.unwrap();
         assert_eq!(&first.view()[..4], b"wake");
@@ -240,8 +247,14 @@ async fn readers_start_at_the_write_cursor_when_their_attachment_completes() {
     producer.view_mut()[..4].copy_from_slice(b"past");
     producer.advance(4).unwrap();
 
-    let mut first = Consumer::connect(&server.endpoint, PORT).await.unwrap();
-    let mut second = Consumer::connect(&server.endpoint, PORT).await.unwrap();
+    let mut first = ConnectOptions::new()
+        .connect(&server.path, PORT)
+        .await
+        .unwrap();
+    let mut second = ConnectOptions::new()
+        .connect(&server.path, PORT)
+        .await
+        .unwrap();
     assert_eq!(
         first.try_reserve(1).err().unwrap().kind(),
         ErrorKind::WouldBlock
@@ -265,7 +278,8 @@ async fn unknown_duplicate_and_retired_ports_are_handled() {
     let server = RunningServer::start("ports");
     let producer = server.server.register("telemetry", 1).unwrap();
     assert_eq!(
-        Consumer::connect(&server.endpoint, "missing")
+        ConnectOptions::new()
+            .connect(&server.path, "missing")
             .await
             .err()
             .unwrap()
@@ -284,7 +298,10 @@ async fn unknown_duplicate_and_retired_ports_are_handled() {
 #[tokio::test]
 async fn readers_receive_the_same_data_and_the_slowest_controls_space() {
     let (server, mut producer, mut first) = named_pair("fanout", 1).await;
-    let mut second = Consumer::connect(&server.endpoint, PORT).await.unwrap();
+    let mut second = ConnectOptions::new()
+        .connect(&server.path, PORT)
+        .await
+        .unwrap();
     let capacity = producer.capacity();
     producer.reserve(capacity).await.unwrap();
     producer.view_mut().fill(b'x');
@@ -311,7 +328,10 @@ async fn readers_receive_the_same_data_and_the_slowest_controls_space() {
 #[tokio::test]
 async fn space_wait_moves_between_blocking_readers() {
     let (server, mut producer, mut first) = named_pair("space-blocker", 1).await;
-    let mut second = Consumer::connect(&server.endpoint, PORT).await.unwrap();
+    let mut second = ConnectOptions::new()
+        .connect(&server.path, PORT)
+        .await
+        .unwrap();
     let capacity = producer.capacity();
     producer.reserve(capacity).await.unwrap();
     producer.advance(capacity).unwrap();
@@ -356,7 +376,10 @@ async fn space_wait_moves_between_blocking_readers() {
 #[tokio::test]
 async fn disconnected_blocking_reader_is_removed_without_an_error() {
     let (server, mut producer, first) = named_pair("reader-eof", 1).await;
-    let mut second = Consumer::connect(&server.endpoint, PORT).await.unwrap();
+    let mut second = ConnectOptions::new()
+        .connect(&server.path, PORT)
+        .await
+        .unwrap();
     let capacity = producer.capacity();
     producer.reserve(capacity).await.unwrap();
     producer.advance(capacity).unwrap();
@@ -376,8 +399,14 @@ async fn multiple_ports_share_one_listener() {
     let server = RunningServer::start("multiple");
     let mut first_producer = server.server.register("first", 1).unwrap();
     let mut second_producer = server.server.register("second", 1).unwrap();
-    let mut first_consumer = Consumer::connect(&server.endpoint, "first").await.unwrap();
-    let mut second_consumer = Consumer::connect(&server.endpoint, "second").await.unwrap();
+    let mut first_consumer = ConnectOptions::new()
+        .connect(&server.path, "first")
+        .await
+        .unwrap();
+    let mut second_consumer = ConnectOptions::new()
+        .connect(&server.path, "second")
+        .await
+        .unwrap();
 
     first_producer.reserve(1).await.unwrap();
     first_producer.view_mut()[0] = b'a';
@@ -398,8 +427,8 @@ async fn concurrent_consumers_on_one_port_all_attach() {
     let _producer = server.server.register(PORT, 1).unwrap();
     let mut tasks = tokio::task::JoinSet::new();
     for _ in 0..8 {
-        let endpoint = server.endpoint.clone();
-        tasks.spawn(async move { Consumer::connect(endpoint, PORT).await });
+        let path = server.path.clone();
+        tasks.spawn(async move { ConnectOptions::new().connect(path, PORT).await });
     }
     let mut connected = Vec::new();
     while let Some(result) = tasks.join_next().await {
@@ -415,10 +444,10 @@ async fn concurrent_consumers_on_one_port_all_attach() {
 async fn producer_remains_live_while_readers_attach_and_drop() {
     let server = RunningServer::start("reader-churn");
     let mut producer = server.server.register(PORT, 1).unwrap();
-    let endpoint = server.endpoint.clone();
+    let path = server.path.clone();
     let churn = tokio::spawn(async move {
         for _ in 0..16 {
-            drop(Consumer::connect(&endpoint, PORT).await.unwrap());
+            drop(ConnectOptions::new().connect(&path, PORT).await.unwrap());
             tokio::task::yield_now().await;
         }
     });
@@ -441,7 +470,10 @@ async fn data_waits_survive_repeated_slot_reuse() {
     let mut producer = server.server.register(PORT, 1).unwrap();
 
     for value in 0_u8..64 {
-        let mut consumer = Consumer::connect(&server.endpoint, PORT).await.unwrap();
+        let mut consumer = ConnectOptions::new()
+            .connect(&server.path, PORT)
+            .await
+            .unwrap();
         let reader = tokio::spawn(async move {
             tokio::time::timeout(Duration::from_secs(1), consumer.reserve(1))
                 .await
@@ -468,10 +500,16 @@ async fn sixty_five_readers_exceed_the_internal_slot_limit() {
     let _producer = server.server.register(PORT, 1).unwrap();
     let mut readers = Vec::new();
     for _ in 0..64 {
-        readers.push(Consumer::connect(&server.endpoint, PORT).await.unwrap());
+        readers.push(
+            ConnectOptions::new()
+                .connect(&server.path, PORT)
+                .await
+                .unwrap(),
+        );
     }
     assert_eq!(
-        Consumer::connect(&server.endpoint, PORT)
+        ConnectOptions::new()
+            .connect(&server.path, PORT)
             .await
             .err()
             .unwrap()
@@ -485,11 +523,11 @@ async fn sixty_five_readers_exceed_the_internal_slot_limit() {
 async fn incomplete_handshake_does_not_block_another_client() {
     let server = RunningServer::start("handshake-concurrency");
     let _producer = server.server.register(PORT, 1).unwrap();
-    let mut incomplete = connect_native(server.endpoint.as_ref()).await.unwrap();
+    let mut incomplete = connect_native(server.path.as_ref()).await.unwrap();
     incomplete.write_all(&[1, 5]).await.unwrap();
     let consumer = tokio::time::timeout(
         Duration::from_secs(1),
-        Consumer::connect(&server.endpoint, PORT),
+        ConnectOptions::new().connect(&server.path, PORT),
     )
     .await
     .unwrap()
@@ -501,7 +539,7 @@ async fn incomplete_handshake_does_not_block_another_client() {
 async fn incomplete_handshake_does_not_backpressure_the_producer() {
     let server = RunningServer::start("handshake-backpressure");
     let mut producer = server.server.register(PORT, 1).unwrap();
-    let (incomplete, _) = begin_raw_handshake(server.endpoint.as_ref(), PORT).await;
+    let (incomplete, _) = begin_raw_handshake(server.path.as_ref(), PORT).await;
     let capacity = producer.capacity();
 
     for _ in 0..3 {
@@ -516,7 +554,7 @@ async fn incomplete_handshake_does_not_backpressure_the_producer() {
 async fn incomplete_handshakes_do_not_keep_registration_alive() {
     let server = RunningServer::start("handshake-shutdown");
     let server_access = server.server.clone();
-    let mut incomplete = connect_native(server.endpoint.as_ref()).await.unwrap();
+    let mut incomplete = connect_native(server.path.as_ref()).await.unwrap();
     incomplete.write_all(&[1, 5]).await.unwrap();
 
     server.stop().await;
@@ -534,13 +572,13 @@ async fn incomplete_handshakes_do_not_keep_registration_alive() {
 
 #[tokio::test]
 async fn server_options_limit_incomplete_handshakes() {
-    let endpoint = TestEndpoint::new("server-timeout");
+    let path = TestPath::new("server-timeout");
     let (_server, task) = ServerOptions::new()
         .handshake_timeout(Duration::from_millis(10))
-        .bind(&endpoint)
+        .bind(&path)
         .unwrap();
     let router = tokio::spawn(task);
-    let mut incomplete = connect_native(endpoint.as_ref()).await.unwrap();
+    let mut incomplete = connect_native(path.as_ref()).await.unwrap();
     incomplete.write_all(&[1, 5]).await.unwrap();
 
     let closed = tokio::time::timeout(Duration::from_millis(500), incomplete.read_u8())
@@ -552,15 +590,15 @@ async fn server_options_limit_incomplete_handshakes() {
 
 #[tokio::test]
 async fn failed_handshakes_release_reader_slots() {
-    let endpoint = TestEndpoint::new("failed-handshake-slot-release");
+    let path = TestPath::new("failed-handshake-slot-release");
     let (server, task) = ServerOptions::new()
         .handshake_timeout(Duration::from_millis(20))
-        .bind(&endpoint)
+        .bind(&path)
         .unwrap();
     let _producer = server.register(PORT, 1).unwrap();
     let router = tokio::spawn(task);
 
-    let (mut malformed, slot) = begin_raw_handshake(endpoint.as_ref(), PORT).await;
+    let (mut malformed, slot) = begin_raw_handshake(path.as_ref(), PORT).await;
     assert_eq!(slot, 0);
     malformed.write_all(b"NOTREADY").await.unwrap();
     assert!(
@@ -570,7 +608,7 @@ async fn failed_handshakes_release_reader_slots() {
             .is_err()
     );
 
-    let (mut timed_out, slot) = begin_raw_handshake(endpoint.as_ref(), PORT).await;
+    let (mut timed_out, slot) = begin_raw_handshake(path.as_ref(), PORT).await;
     assert_eq!(slot, 0);
     assert!(
         tokio::time::timeout(Duration::from_millis(500), timed_out.read_u8())
@@ -579,7 +617,7 @@ async fn failed_handshakes_release_reader_slots() {
             .is_err()
     );
 
-    let (replacement, slot) = begin_raw_handshake(endpoint.as_ref(), PORT).await;
+    let (replacement, slot) = begin_raw_handshake(path.as_ref(), PORT).await;
     assert_eq!(slot, 0);
     drop(replacement);
     router.abort();
@@ -587,11 +625,11 @@ async fn failed_handshakes_release_reader_slots() {
 
 #[tokio::test]
 async fn connect_options_limit_an_unresponsive_server() {
-    let endpoint = TestEndpoint::new("consumer-timeout");
+    let path = TestPath::new("consumer-timeout");
 
     #[cfg(unix)]
     let stalled_server = {
-        let listener = tokio::net::UnixListener::bind(endpoint.as_ref()).unwrap();
+        let listener = tokio::net::UnixListener::bind(path.as_ref()).unwrap();
         tokio::spawn(async move {
             let _stream = listener.accept().await.unwrap();
             std::future::pending::<()>().await;
@@ -603,7 +641,7 @@ async fn connect_options_limit_an_unresponsive_server() {
         let server = tokio::net::windows::named_pipe::ServerOptions::new()
             .first_pipe_instance(true)
             .reject_remote_clients(true)
-            .create(endpoint.as_ref().as_os_str())
+            .create(path.as_ref().as_os_str())
             .unwrap();
         tokio::spawn(async move {
             server.connect().await.unwrap();
@@ -613,7 +651,7 @@ async fn connect_options_limit_an_unresponsive_server() {
 
     let error = ConnectOptions::new()
         .handshake_timeout(Duration::from_millis(10))
-        .connect(&endpoint, PORT)
+        .connect(&path, PORT)
         .await
         .err()
         .unwrap();
@@ -632,7 +670,10 @@ async fn producer_never_fills_before_the_first_consumer() {
         assert_eq!(snapshot_len(&mut producer), capacity);
     }
 
-    let mut consumer = Consumer::connect(&server.endpoint, PORT).await.unwrap();
+    let mut consumer = ConnectOptions::new()
+        .connect(&server.path, PORT)
+        .await
+        .unwrap();
     assert_eq!(
         consumer.try_reserve(1).err().unwrap().kind(),
         ErrorKind::WouldBlock
@@ -664,7 +705,10 @@ async fn ended_listener_task_rejects_registration_but_active_ring_survives() {
     let server = RunningServer::start("stop-active");
     let server_access = server.server.clone();
     let mut producer = server_access.register(PORT, 1).unwrap();
-    let mut consumer = Consumer::connect(&server.endpoint, PORT).await.unwrap();
+    let mut consumer = ConnectOptions::new()
+        .connect(&server.path, PORT)
+        .await
+        .unwrap();
 
     let capacity = producer.capacity();
     producer.reserve(capacity).await.unwrap();

@@ -123,7 +123,7 @@ pub(crate) struct MappedMemory {
     capacity: usize,
 }
 
-// SAFETY: mappings are stable; mutable access is controlled by endpoint roles.
+// SAFETY: mappings are stable; mutable access is controlled by producer and consumer roles.
 unsafe impl Send for MappedMemory {}
 unsafe impl Sync for MappedMemory {}
 

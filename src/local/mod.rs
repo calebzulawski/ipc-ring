@@ -24,17 +24,23 @@ pub use consumer::Consumer;
 pub use producer::Producer;
 
 use crate::mapping;
+use crate::view::View;
 use std::io;
 use std::sync::Arc;
 
 /// Creates a local ring with at least the requested payload capacity.
-pub fn create(minimum_capacity: usize) -> io::Result<(Producer, Consumer)> {
+pub fn create(minimum_capacity: usize) -> io::Result<(View<Producer>, View<Consumer>)> {
     let (_shared_memory, memory) = mapping::create(minimum_capacity)?;
     let memory = Arc::new(memory);
     let (producer_notification, consumer_notification) = notification::pair();
     let (readers, slot, local_reader) =
         reader::create_registry(Arc::clone(&memory), producer_notification)?;
-    let producer = Producer::new(readers);
-    let consumer = Consumer::new(memory, slot, consumer_notification, local_reader);
+    let producer = View::from_cursor(Producer::new(readers));
+    let consumer = View::from_cursor(Consumer::new(
+        memory,
+        slot,
+        consumer_notification,
+        local_reader,
+    ));
     Ok((producer, consumer))
 }

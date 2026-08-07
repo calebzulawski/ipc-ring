@@ -9,8 +9,7 @@ mod error;
 pub mod ipc;
 pub mod local;
 mod mapping;
+pub mod raw;
 mod ring;
 mod sys;
-mod view;
-
-pub use view::{View, ViewMut};
+pub mod view;

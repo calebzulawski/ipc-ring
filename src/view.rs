@@ -1,15 +1,17 @@
-//! Byte views shared by ring producers and consumers.
+//! Safe stateful access to indexed byte cursors.
 
+use crate::raw::{Cursor, CursorMut, Reservation};
 use std::io;
+use std::slice;
 
-/// Reserves and advances bytes on one side of a ring.
+/// Retains one safe reservation over an indexed byte cursor.
 ///
 /// Each operation follows the same cycle:
 ///
 /// 1. Call [`try_reserve`](Self::try_reserve) or [`reserve`](Self::reserve) with
 ///    the minimum number of bytes needed.
 /// 2. Access the reserved bytes through [`view`](Self::view), or
-///    [`ViewMut::view_mut`] when writing.
+///    [`view_mut`](Self::view_mut) when `C` implements [`CursorMut`].
 /// 3. Call [`advance`](Self::advance) with the number of bytes that were read or
 ///    written.
 ///
@@ -19,8 +21,6 @@ use std::io;
 /// makes read bytes available for writing again.
 ///
 /// ```
-/// use ipc_ring::{View, ViewMut};
-///
 /// fn send_one_message() -> std::io::Result<()> {
 ///     let (mut producer, mut consumer) = ipc_ring::local::create(1)?;
 ///
@@ -34,30 +34,69 @@ use std::io;
 ///     Ok(())
 /// }
 /// ```
-#[allow(async_fn_in_trait)]
-pub trait View {
+pub struct View<C: Cursor> {
+    cursor: C,
+    pending: Option<Reservation>,
+}
+
+impl<C: Cursor> View<C> {
+    pub(crate) fn from_cursor(cursor: C) -> Self {
+        Self {
+            cursor,
+            pending: None,
+        }
+    }
+
+    pub(crate) fn cursor(&self) -> &C {
+        &self.cursor
+    }
+
+    pub(crate) fn cursor_mut(&mut self) -> &mut C {
+        &mut self.cursor
+    }
+
     /// Returns the buffer capacity in bytes.
-    fn capacity(&self) -> usize;
+    pub fn capacity(&self) -> usize {
+        self.cursor.capacity()
+    }
 
     /// Immediately reserves at least `minimum` bytes or returns `WouldBlock`.
     ///
     /// Calling this method clears any previous reservation, including when the
     /// new request fails. Use a minimum of zero to reserve however many bytes
     /// are currently available without waiting.
-    fn try_reserve(&mut self, minimum: usize) -> io::Result<()>;
+    pub fn try_reserve(&mut self, minimum: usize) -> io::Result<()> {
+        self.pending = None;
+        let position = self.cursor.position();
+        self.pending = Some(self.cursor_mut().try_reserve_at(position, minimum)?);
+        Ok(())
+    }
 
     /// Waits until at least `minimum` bytes can be reserved.
     ///
     /// The previous reservation is cleared when the returned future is first
     /// polled. Merely creating and dropping the future leaves the previous
     /// reservation unchanged.
-    async fn reserve(&mut self, minimum: usize) -> io::Result<()>;
+    pub async fn reserve(&mut self, minimum: usize) -> io::Result<()> {
+        self.pending = None;
+        let position = self.cursor.position();
+        self.pending = Some(self.cursor_mut().reserve_at(position, minimum).await?);
+        Ok(())
+    }
 
     /// Returns the reserved bytes.
     ///
     /// The slice is empty when there is no reservation or no bytes were
     /// available for a zero-minimum reservation.
-    fn view(&self) -> &[u8];
+    pub fn view(&self) -> &[u8] {
+        let Some(reservation) = self.pending else {
+            return &[];
+        };
+        // SAFETY: `Cursor` guarantees that a returned reservation is valid
+        // until advancement passes its position. This type does not expose its
+        // cursor and clears `pending` before advancing.
+        unsafe { slice::from_raw_parts(reservation.ptr, reservation.len) }
+    }
 
     /// Marks the first `amount` reserved bytes as complete.
     ///
@@ -65,11 +104,38 @@ pub trait View {
     /// reservation, returns `InvalidInput` and does not advance the ring.
     /// Advancing zero bytes always succeeds. Every call clears the current
     /// reservation.
-    fn advance(&mut self, amount: usize) -> io::Result<()>;
+    pub fn advance(&mut self, amount: usize) -> io::Result<()> {
+        let pending = self.pending.take();
+        if amount == 0 {
+            return Ok(());
+        }
+        let Some(reservation) = pending.filter(|reservation| amount <= reservation.len) else {
+            return Err(crate::error::invalid_length());
+        };
+        let position = reservation.position.wrapping_add(amount as u64);
+        // SAFETY: `amount` lies within a readable reservation returned by the
+        // cursor, and no slice can remain borrowed across this mutable call.
+        // Consequently, the range is initialized and no safe access retained
+        // by this view is invalidated.
+        unsafe { self.cursor_mut().advance_to(position) }
+    }
 }
 
-/// A view that allows changing reserved bytes before advancing.
-pub trait ViewMut: View {
-    /// Returns the reserved bytes for writing.
-    fn view_mut(&mut self) -> &mut [u8];
+impl<C: CursorMut> View<C> {
+    /// Returns the reserved bytes for in-place modification.
+    ///
+    /// Consumer views do not provide mutable access:
+    ///
+    /// ```compile_fail
+    /// let (_, mut consumer) = ipc_ring::local::create(1).unwrap();
+    /// consumer.view_mut();
+    /// ```
+    pub fn view_mut(&mut self) -> &mut [u8] {
+        let Some(reservation) = self.pending else {
+            return &mut [];
+        };
+        // SAFETY: `CursorMut` guarantees that reservations are uniquely
+        // writable while the cursor and this safe view are exclusively borrowed.
+        unsafe { slice::from_raw_parts_mut(reservation.ptr.cast_mut(), reservation.len) }
+    }
 }

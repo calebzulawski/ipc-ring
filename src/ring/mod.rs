@@ -2,7 +2,6 @@
 
 mod abi;
 pub(crate) mod consumer;
-mod pending;
 pub(crate) mod producer;
 pub(crate) mod reader;
 mod state;
@@ -12,4 +11,3 @@ pub(crate) mod wake;
 mod tests;
 
 pub(crate) use abi::{ABI_VERSION, Header, MAX_READERS};
-pub(crate) use pending::PendingView;

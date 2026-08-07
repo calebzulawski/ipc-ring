@@ -12,12 +12,24 @@ pub(super) fn set_waiter_bit(waiters: &AtomicU64, bit: u64) -> impl Drop + '_ {
     })
 }
 
-/// Rejects spans larger than the double-mapped payload.
+/// Rejects reservations larger than the double-mapped payload.
 pub(super) fn valid_len(len: usize, capacity: usize) -> io::Result<()> {
     if len > capacity {
         Err(error::invalid_length())
     } else {
         Ok(())
+    }
+}
+
+/// Returns a caller-supplied forward cursor distance within one capacity.
+pub(super) fn input_distance(to: u64, from: u64, capacity: usize) -> io::Result<usize> {
+    let len = to.wrapping_sub(from);
+    if len > capacity as u64 {
+        Err(error::invalid_input(
+            "position is behind the cursor or more than one ring capacity ahead",
+        ))
+    } else {
+        Ok(len as usize)
     }
 }
 

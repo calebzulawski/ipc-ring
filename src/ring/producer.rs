@@ -1,14 +1,13 @@
-//! Producer-side reservations, cursor publication, and reader wakeups.
+//! Producer-side raw reservations, cursor publication, and reader wakeups.
 
-use super::PendingView;
 use super::reader::{ActiveReaders, ReaderConnection, ReaderRegistry};
-use super::state::{set_waiter_bit, used, valid_len};
+use super::state::{input_distance, set_waiter_bit, valid_len};
 use super::wake::ProducerWake;
 use crate::error;
 use crate::mapping::MappedMemory;
+use crate::raw::Reservation;
 use arc_swap::{ArcSwap, Cache};
 use std::io;
-use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -20,18 +19,16 @@ enum WritableState<N> {
     BlockedByReader(Arc<ReaderConnection<N>>),
 }
 
-pub(crate) trait ProducerEndpoint {
+pub(crate) trait ProducerState {
     type Notification: ProducerWake;
     const SURVIVES_WITHOUT_READERS: bool;
 
     fn memory(&self) -> &Arc<MappedMemory>;
     fn registry(&self) -> &Arc<ReaderRegistry<Self::Notification>>;
     fn reader_cache(&mut self) -> &mut ReaderCache<Self::Notification>;
-    fn pending(&self) -> Option<PendingView>;
-    fn pending_mut(&mut self) -> &mut Option<PendingView>;
 }
 
-fn write_position<P: ProducerEndpoint>(producer: &P) -> u64 {
+pub(crate) fn position<P: ProducerState>(producer: &P) -> u64 {
     producer
         .memory()
         .header()
@@ -59,7 +56,7 @@ fn scan_writable_state<N: ProducerWake>(
         let slot = active.trailing_zeros() as usize;
         active &= !(1_u64 << slot);
         let read_position = memory.header().read_positions[slot].load(Ordering::Acquire);
-        let buffered = used(write_position, read_position, capacity)?;
+        let buffered = super::state::used(write_position, read_position, capacity)?;
         if buffered > blocking_distance {
             let reader = readers.connections[slot]
                 .as_ref()
@@ -72,7 +69,7 @@ fn scan_writable_state<N: ProducerWake>(
     Ok(WritableState::Available(capacity - greatest_buffered))
 }
 
-fn writable_state<P: ProducerEndpoint>(
+fn writable_state<P: ProducerState>(
     producer: &mut P,
     minimum: usize,
 ) -> io::Result<WritableState<P::Notification>> {
@@ -83,42 +80,60 @@ fn writable_state<P: ProducerEndpoint>(
     scan_writable_state(producer.memory(), &readers, minimum)
 }
 
-fn install_pending<P: ProducerEndpoint>(producer: &mut P, available: usize) {
+fn requested_len<P: ProducerState>(
+    producer: &P,
+    start: u64,
+    minimum: usize,
+) -> io::Result<(usize, usize)> {
     let capacity = producer.memory().capacity();
-    let pending = PendingView::new(write_position(producer), available, capacity);
-    *producer.pending_mut() = Some(pending);
+    valid_len(minimum, capacity)?;
+    let offset = input_distance(start, position(producer), capacity)?;
+    let required = offset
+        .checked_add(minimum)
+        .filter(|required| *required <= capacity)
+        .ok_or_else(error::invalid_length)?;
+    Ok((offset, required))
 }
 
-pub(crate) fn try_reserve<P: ProducerEndpoint>(producer: &mut P, minimum: usize) -> io::Result<()> {
-    *producer.pending_mut() = None;
-    valid_len(minimum, producer.memory().capacity())?;
-    match writable_state(producer, minimum)? {
-        WritableState::Available(available) => {
-            install_pending(producer, available);
-            Ok(())
-        }
+fn reservation<P: ProducerState>(producer: &P, start: u64, len: usize) -> Reservation {
+    let capacity = producer.memory().capacity();
+    let offset = (start & (capacity as u64 - 1)) as usize;
+    // SAFETY: mappings contain two adjacent payload views, and `len` was
+    // validated to remain within one capacity from `start`.
+    let ptr = unsafe { producer.memory().payload().add(offset) } as *const u8;
+    Reservation {
+        position: start,
+        ptr,
+        len,
+    }
+}
+
+pub(crate) fn try_reserve_at<P: ProducerState>(
+    producer: &mut P,
+    start: u64,
+    minimum: usize,
+) -> io::Result<Reservation> {
+    let (offset, required) = requested_len(producer, start, minimum)?;
+    match writable_state(producer, required)? {
+        WritableState::Available(available) => Ok(reservation(producer, start, available - offset)),
         WritableState::BlockedByReader(_) => Err(error::would_block()),
     }
 }
 
-pub(crate) async fn reserve<P: ProducerEndpoint>(
+pub(crate) async fn reserve_at<P: ProducerState>(
     producer: &mut P,
+    start: u64,
     minimum: usize,
-) -> io::Result<()> {
-    *producer.pending_mut() = None;
-    valid_len(minimum, producer.memory().capacity())?;
-    let available = wait_for_space(producer, minimum).await?;
-    install_pending(producer, available);
-    Ok(())
+) -> io::Result<Reservation> {
+    let (offset, required) = requested_len(producer, start, minimum)?;
+    let available = wait_for_space(producer, required).await?;
+    Ok(reservation(producer, start, available - offset))
 }
 
 /// Waits on one blocking reader and rechecks after its next notification.
-async fn wait_for_space<P: ProducerEndpoint>(
-    producer: &mut P,
-    minimum: usize,
-) -> io::Result<usize> {
+async fn wait_for_space<P: ProducerState>(producer: &mut P, required: usize) -> io::Result<usize> {
     loop {
-        let reader = match writable_state(producer, minimum)? {
+        let reader = match writable_state(producer, required)? {
             WritableState::Available(available) => return Ok(available),
             WritableState::BlockedByReader(reader) => reader,
         };
@@ -128,7 +143,7 @@ async fn wait_for_space<P: ProducerEndpoint>(
         let bit = 1_u64 << reader.slot();
         let _waiter_bit = set_waiter_bit(&memory.header().space_waiters, bit);
 
-        let still_blocking = match writable_state(producer, minimum)? {
+        let still_blocking = match writable_state(producer, required)? {
             WritableState::Available(available) => return Ok(available),
             WritableState::BlockedByReader(reader) => reader,
         };
@@ -142,41 +157,25 @@ async fn wait_for_space<P: ProducerEndpoint>(
     }
 }
 
-pub(crate) fn view<P: ProducerEndpoint>(producer: &P) -> &[u8] {
-    let Some(pending) = producer.pending() else {
-        return &[];
-    };
-    // SAFETY: the pending span was validated against all active read cursors.
-    unsafe { slice::from_raw_parts(producer.memory().payload().add(pending.offset), pending.len) }
-}
-
-pub(crate) fn view_mut<P: ProducerEndpoint>(producer: &mut P) -> &mut [u8] {
-    let Some(pending) = producer.pending() else {
-        return &mut [];
-    };
-    // SAFETY: the unique producer borrow owns the validated double-mapped span.
-    unsafe {
-        slice::from_raw_parts_mut(producer.memory().payload().add(pending.offset), pending.len)
-    }
-}
-
-pub(crate) fn advance<P: ProducerEndpoint>(producer: &mut P, amount: usize) -> io::Result<()> {
-    let pending = producer.pending_mut().take();
+pub(crate) unsafe fn advance_to<P: ProducerState>(producer: &mut P, target: u64) -> io::Result<()> {
+    let current = position(producer);
+    let amount = input_distance(target, current, producer.memory().capacity())?;
     if amount == 0 {
         return Ok(());
     }
-    let Some(pending) = pending.filter(|pending| amount <= pending.len) else {
-        return Err(error::invalid_length());
-    };
-    publish_data(producer, pending.position, amount)
+    if matches!(
+        writable_state(producer, amount)?,
+        WritableState::BlockedByReader(_)
+    ) {
+        return Err(error::invalid_input(
+            "advance position exceeds the writable extent",
+        ));
+    }
+    publish_data(producer, target)
 }
 
 /// Makes advanced bytes visible and wakes readers waiting for data.
-fn publish_data<P: ProducerEndpoint>(
-    producer: &mut P,
-    position: u64,
-    amount: usize,
-) -> io::Result<()> {
+fn publish_data<P: ProducerState>(producer: &mut P, target: u64) -> io::Result<()> {
     let readers = producer.reader_cache().load().clone();
     if !P::SURVIVES_WITHOUT_READERS && readers.bitmap == 0 {
         return Err(crate::error::peer_disconnected());
@@ -185,7 +184,7 @@ fn publish_data<P: ProducerEndpoint>(
         .memory()
         .header()
         .write_position
-        .store(position.wrapping_add(amount as u64), Ordering::Release);
+        .store(target, Ordering::Release);
 
     let waiting = producer.registry().take_data_waiters();
     if waiting != 0 {

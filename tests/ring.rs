@@ -1,12 +1,14 @@
-use ipc_ring::{View, ViewMut, local};
+use ipc_ring::local;
+use ipc_ring::raw::{Cursor, CursorMut};
+use ipc_ring::view::View;
 use std::io;
 use std::io::ErrorKind;
 use std::sync::Arc;
 use std::time::Duration;
 
-async fn copy_reserved<S: View, D: ViewMut>(
-    source: &mut S,
-    destination: &mut D,
+async fn copy_reserved<S: Cursor, D: CursorMut>(
+    source: &mut View<S>,
+    destination: &mut View<D>,
     minimum: usize,
 ) -> io::Result<()> {
     source.reserve(minimum).await?;
@@ -17,10 +19,10 @@ async fn copy_reserved<S: View, D: ViewMut>(
     destination.advance(amount)
 }
 
-fn snapshot_len<V: View>(endpoint: &mut V) -> usize {
-    endpoint.try_reserve(0).unwrap();
-    let len = endpoint.view().len();
-    endpoint.advance(0).unwrap();
+fn snapshot_len<C: Cursor>(view: &mut View<C>) -> usize {
+    view.try_reserve(0).unwrap();
+    let len = view.view().len();
+    view.advance(0).unwrap();
     len
 }
 
@@ -284,7 +286,7 @@ fn local_reader_admission_is_concurrent_bounded_and_reusable() {
 }
 
 #[tokio::test]
-async fn local_endpoint_removal_is_per_reader_and_final() {
+async fn local_reader_removal_is_independent_and_final() {
     let (mut producer, first) = local::create(1).unwrap();
     let second = first.try_clone().unwrap();
     drop(second);
@@ -399,7 +401,7 @@ async fn dropping_local_producer_wakes_the_consumer() {
 }
 
 #[tokio::test]
-async fn span_validation_errors_are_invalid_input() {
+async fn reservation_validation_errors_are_invalid_input() {
     let (mut producer, mut consumer) = local::create(1).unwrap();
     let invalid = producer.capacity() + 1;
     assert_eq!(

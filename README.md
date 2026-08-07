@@ -11,21 +11,22 @@ with no readers, while a local producer reports `BrokenPipe` after its final
 reader disappears. One local server routes clients to any number of rings by
 UTF-8 port name.
 
-Endpoint constructors accept a native path. On Unix this is the exact
+IPC connection functions accept a native path. On Unix this is the exact
 Unix-domain socket pathname; callers secure its parent directory and remove
 stale or retired socket files. On Windows it is a complete local named-pipe
 path such as `\\.\pipe\my-ring`.
 
 ```rust,no_run
-use ipc_ring::ipc::{Consumer, Server};
-use ipc_ring::{View, ViewMut};
+use ipc_ring::ipc::{ConnectOptions, Server};
 
 # async fn example() -> std::io::Result<()> {
 let (server, task) = Server::bind("/tmp/my-service.sock")?;
 let router = tokio::spawn(task);
 
 let mut producer = server.register("telemetry", 64 * 1024)?;
-let mut consumer = Consumer::connect("/tmp/my-service.sock", "telemetry").await?;
+let mut consumer = ConnectOptions::new()
+    .connect("/tmp/my-service.sock", "telemetry")
+    .await?;
 
 producer.reserve(4).await?;
 producer.view_mut()[..4].copy_from_slice(b"ping");
@@ -40,12 +41,12 @@ router.abort();
 # }
 ```
 
-For an in-process ring, `local::create(capacity)` returns a
+For an in-process ring, `local::create(capacity)` returns safe views over a
 `local::Producer` and `local::Consumer`. Additional local readers can be
-created with `local::Consumer::try_clone`:
+created with `try_clone` on the consumer view:
 
 ```rust
-use ipc_ring::{View, ViewMut, local};
+use ipc_ring::local;
 
 # fn example() -> std::io::Result<()> {
 let (mut producer, mut consumer) = local::create(1024)?;
@@ -63,11 +64,12 @@ second_consumer.try_reserve(4)?;
 
 Listener binding is synchronous. Consumer connection, routing, and ring waits
 run entirely on the caller's Tokio runtime. Immediate reservations and cursor
-advancement remain synchronous. Ring operations are supplied by the open
-`View` and `ViewMut` traits; the concrete endpoint type determines whether
-`advance` publishes producer bytes or releases consumer bytes. Reservations
-request a minimum length and expose the full availability snapshot observed by
-their successful check.
+advancement remain synchronous. The local and IPC producer and consumer types implement
+`raw::Cursor`; constructors wrap them in `view::View`, which retains one safe
+reservation. Producers additionally implement `raw::CursorMut`, enabling
+in-place modification through `view_mut`. Reservations request a minimum
+length and expose the full availability snapshot observed by their successful
+check.
 
 Each complete handshake has a one-second default timeout.
 `ipc::ServerOptions::handshake_timeout` and

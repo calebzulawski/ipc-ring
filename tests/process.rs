@@ -1,16 +1,15 @@
-use ipc_ring::ipc::{Consumer, Server};
-use ipc_ring::{View, ViewMut};
+use ipc_ring::ipc::{ConnectOptions, Server};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const MODE: &str = "IPC_RING_TEST_MODE";
-const ENDPOINT: &str = "IPC_RING_TEST_ENDPOINT";
+const CONNECTION_PATH: &str = "IPC_RING_TEST_PATH";
 const PORT: &str = "main";
 
-struct Endpoint(PathBuf);
+struct TestPath(PathBuf);
 
-impl Endpoint {
+impl TestPath {
     fn new(label: &str) -> Self {
         #[cfg(unix)]
         let path = env::temp_dir().join(format!(
@@ -31,7 +30,7 @@ impl Endpoint {
 }
 
 #[cfg(unix)]
-impl Drop for Endpoint {
+impl Drop for TestPath {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
@@ -40,27 +39,27 @@ impl Drop for Endpoint {
 fn child_mode() -> Option<(String, PathBuf)> {
     Some((
         env::var(MODE).ok()?,
-        env::var_os(ENDPOINT)
+        env::var_os(CONNECTION_PATH)
             .map(PathBuf::from)
-            .expect("child ring endpoint"),
+            .expect("child ring connection path"),
     ))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cross_process_fanout_reaches_two_readers() {
-    if let Some((mode, endpoint)) = child_mode() {
+    if let Some((mode, path)) = child_mode() {
         if mode != "fanout" {
             return;
         }
-        let mut consumer = Consumer::connect(&endpoint, PORT).await.unwrap();
+        let mut consumer = ConnectOptions::new().connect(&path, PORT).await.unwrap();
         consumer.reserve(5).await.unwrap();
         assert_eq!(&consumer.view()[..5], b"hello");
         consumer.advance(5).unwrap();
         return;
     }
 
-    let endpoint = Endpoint::new("fanout");
-    let (server, task) = Server::bind(endpoint.path()).unwrap();
+    let path = TestPath::new("fanout");
+    let (server, task) = Server::bind(path.path()).unwrap();
     let mut producer = server.register(PORT, 64 * 1024).unwrap();
     let router = tokio::spawn(task);
     let capacity = producer.capacity();
@@ -70,7 +69,7 @@ async fn cross_process_fanout_reaches_two_readers() {
             .arg("cross_process_fanout_reaches_two_readers")
             .arg("--nocapture")
             .env(MODE, "fanout")
-            .env(ENDPOINT, endpoint.path())
+            .env(CONNECTION_PATH, path.path())
             .spawn()
             .unwrap()
     };
@@ -102,16 +101,16 @@ async fn cross_process_fanout_reaches_two_readers() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn crashed_consumer_is_removed_without_requiring_a_replacement() {
-    if let Some((mode, endpoint)) = child_mode() {
+    if let Some((mode, path)) = child_mode() {
         if mode != "crash" {
             return;
         }
-        let _consumer = Consumer::connect(&endpoint, PORT).await.unwrap();
+        let _consumer = ConnectOptions::new().connect(&path, PORT).await.unwrap();
         std::process::abort();
     }
 
-    let endpoint = Endpoint::new("crash");
-    let (server, task) = Server::bind(endpoint.path()).unwrap();
+    let path = TestPath::new("crash");
+    let (server, task) = Server::bind(path.path()).unwrap();
     let mut producer = server.register(PORT, 64 * 1024).unwrap();
     let router = tokio::spawn(task);
     let status = Command::new(env::current_exe().unwrap())
@@ -119,7 +118,7 @@ async fn crashed_consumer_is_removed_without_requiring_a_replacement() {
         .arg("crashed_consumer_is_removed_without_requiring_a_replacement")
         .arg("--nocapture")
         .env(MODE, "crash")
-        .env(ENDPOINT, endpoint.path())
+        .env(CONNECTION_PATH, path.path())
         .status()
         .unwrap();
     assert!(!status.success(), "crashing peer unexpectedly succeeded");

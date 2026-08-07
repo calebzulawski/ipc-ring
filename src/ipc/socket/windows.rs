@@ -1,4 +1,4 @@
-//! Implements the Windows control endpoint with Tokio byte-mode named pipes.
+//! Implements the Windows control connection with Tokio byte-mode named pipes.
 
 use crate::sys::windows::owned;
 use std::io;

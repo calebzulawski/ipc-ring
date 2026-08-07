@@ -20,10 +20,12 @@
 //! # Read side
 //!
 //! ```rust,no_run
-//! use ipc_ring::ipc::Consumer;
+//! use ipc_ring::ipc::ConnectOptions;
 //!
 //! # async fn read_side() -> std::io::Result<()> {
-//! let _consumer = Consumer::connect("/tmp/example.sock", "events").await?;
+//! let _consumer = ConnectOptions::new()
+//!     .connect("/tmp/example.sock", "events")
+//!     .await?;
 //! # Ok(())
 //! # }
 //! ```

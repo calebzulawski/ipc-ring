@@ -1,24 +1,22 @@
-//! Consumer endpoint for a local ring.
+//! Consumer for a local ring.
 
 use super::notification;
 use super::reader;
-use crate::View;
 use crate::mapping::MappedMemory;
+use crate::raw::{Cursor, Reservation};
 #[cfg(test)]
 use crate::ring::Header;
-use crate::ring::PendingView;
-use crate::ring::consumer::{self as operations, ConsumerEndpoint};
+use crate::ring::consumer::{self as operations, ConsumerState};
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-/// One reader of a local in-process ring.
+/// Raw state for one reader of a local in-process ring.
 pub struct Consumer {
     memory: Arc<MappedMemory>,
     slot: u8,
     notification: notification::Consumer,
     local_reader: reader::Guard,
-    pending: Option<PendingView>,
 }
 
 impl Consumer {
@@ -33,12 +31,10 @@ impl Consumer {
             slot,
             notification,
             local_reader,
-            pending: None,
         }
     }
 
-    /// Creates an independent reader beginning at this reader's current cursor.
-    pub fn try_clone(&self) -> io::Result<Self> {
+    fn try_clone(&self) -> io::Result<Self> {
         let (producer_notification, notification) = notification::pair();
         let read_position =
             self.memory.header().read_positions[self.slot as usize].load(Ordering::Acquire);
@@ -50,17 +46,11 @@ impl Consumer {
             slot,
             notification,
             local_reader,
-            pending: None,
         })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn header(&self) -> &Header {
-        self.memory.header()
     }
 }
 
-impl ConsumerEndpoint for Consumer {
+impl ConsumerState for Consumer {
     type Notification = notification::Consumer;
 
     fn memory(&self) -> &Arc<MappedMemory> {
@@ -78,34 +68,43 @@ impl ConsumerEndpoint for Consumer {
     fn notification_mut(&mut self) -> &mut Self::Notification {
         &mut self.notification
     }
-
-    fn pending(&self) -> Option<PendingView> {
-        self.pending
-    }
-
-    fn pending_mut(&mut self) -> &mut Option<PendingView> {
-        &mut self.pending
-    }
 }
 
-impl View for Consumer {
+// SAFETY: the local mapping is double-mapped and remains alive with the
+// cursor. The ring operations validate indexed reservations and synchronize the
+// shared cursors before returning or advancing them.
+unsafe impl Cursor for Consumer {
     fn capacity(&self) -> usize {
         self.memory.capacity()
     }
 
-    fn try_reserve(&mut self, minimum: usize) -> io::Result<()> {
-        operations::try_reserve(self, minimum)
+    fn position(&self) -> u64 {
+        operations::position(self)
     }
 
-    async fn reserve(&mut self, minimum: usize) -> io::Result<()> {
-        operations::reserve(self, minimum).await
+    fn try_reserve_at(&mut self, position: u64, minimum: usize) -> io::Result<Reservation> {
+        operations::try_reserve_at(self, position, minimum)
     }
 
-    fn view(&self) -> &[u8] {
-        operations::view(self)
+    async fn reserve_at(&mut self, position: u64, minimum: usize) -> io::Result<Reservation> {
+        operations::reserve_at(self, position, minimum).await
     }
 
-    fn advance(&mut self, amount: usize) -> io::Result<()> {
-        operations::advance(self, amount)
+    unsafe fn advance_to(&mut self, position: u64) -> io::Result<()> {
+        // SAFETY: the caller supplies the raw-access and initialization
+        // guarantees required by `Cursor::advance_to`.
+        unsafe { operations::advance_to(self, position) }
+    }
+}
+
+impl crate::view::View<Consumer> {
+    /// Creates an independent reader beginning at this reader's current cursor.
+    pub fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self::from_cursor(self.cursor().try_clone()?))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn header(&self) -> &Header {
+        self.cursor().memory.header()
     }
 }

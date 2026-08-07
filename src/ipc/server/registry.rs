@@ -1,6 +1,7 @@
 use crate::ipc::Producer;
 use crate::ipc::handshake;
 use crate::ipc::registered::RegisteredRing;
+use crate::view::View;
 use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex, Weak};
@@ -17,7 +18,7 @@ impl Server {
         &self,
         port: impl Into<String>,
         minimum_capacity: usize,
-    ) -> io::Result<Producer> {
+    ) -> io::Result<View<Producer>> {
         self.registry
             .upgrade()
             .ok_or_else(crate::error::peer_disconnected)?
@@ -44,7 +45,7 @@ impl ServerRegistry {
             .and_then(Weak::upgrade)
     }
 
-    fn register_ring(&self, port: String, minimum_capacity: usize) -> io::Result<Producer> {
+    fn register_ring(&self, port: String, minimum_capacity: usize) -> io::Result<View<Producer>> {
         handshake::validate_port(&port)?;
         let mut rings_by_port = self
             .rings_by_port
@@ -58,6 +59,6 @@ impl ServerRegistry {
         rings_by_port.insert(port, Arc::downgrade(&registered_ring));
         drop(rings_by_port);
 
-        Ok(Producer::registered(registered_ring))
+        Ok(View::from_cursor(Producer::registered(registered_ring)))
     }
 }

@@ -1,4 +1,4 @@
-//! Wakes the two endpoints of a local ring without an IPC stream.
+//! Wakes the producer and consumer of a local ring without an IPC stream.
 
 use crate::ring::wake::{ConsumerWake, ProducerWake};
 use std::io;
@@ -30,7 +30,7 @@ impl LocalNotifications {
     }
 }
 
-/// Producer-side endpoint of one local reader's wake channel.
+/// Producer-side handle for one local reader's wake channel.
 pub(crate) struct Producer(Arc<LocalNotifications>);
 
 impl ProducerWake for Producer {
@@ -66,7 +66,7 @@ impl Drop for Producer {
     }
 }
 
-/// Consumer-side endpoint of one local reader's wake channel.
+/// Consumer-side handle for one local reader's wake channel.
 pub(crate) struct Consumer(Arc<LocalNotifications>);
 
 impl ConsumerWake for Consumer {
@@ -98,7 +98,7 @@ impl Drop for Consumer {
     }
 }
 
-/// Creates both endpoints of a local ring's wake channel.
+/// Creates both handles for a local ring's wake channel.
 pub(crate) fn pair() -> (Producer, Consumer) {
     let notifications = Arc::new(LocalNotifications::new());
     (

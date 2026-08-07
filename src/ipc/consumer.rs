@@ -1,12 +1,13 @@
-//! Consumer endpoint for a server-registered ring.
+//! Consumer for a server-registered ring.
 
 use super::handshake;
 use super::notification;
 use super::socket::ConsumerStream;
-use crate::View;
 use crate::mapping::MappedMemory;
-use crate::ring::consumer::{self as operations, ConsumerEndpoint};
-use crate::ring::{MAX_READERS, PendingView};
+use crate::raw::{Cursor, Reservation};
+use crate::ring::MAX_READERS;
+use crate::ring::consumer::{self as operations, ConsumerState};
+use crate::view::View;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
@@ -37,11 +38,13 @@ impl ConnectOptions {
         self,
         path: impl AsRef<Path>,
         port: impl Into<String>,
-    ) -> io::Result<Consumer> {
+    ) -> io::Result<View<Consumer>> {
         let path = path.as_ref().to_path_buf();
         let port = port.into();
         let (slot, stream, memory) = handshake::connect(path, port, self.handshake_timeout).await?;
-        Consumer::from_attachment(slot, stream, memory)
+        Ok(View::from_cursor(Consumer::from_attachment(
+            slot, stream, memory,
+        )?))
     }
 }
 
@@ -51,12 +54,11 @@ impl Default for ConnectOptions {
     }
 }
 
-/// One reader attached through a server.
+/// Raw state for one reader attached through a server.
 pub struct Consumer {
     memory: Arc<MappedMemory>,
     slot: u8,
     notification: notification::Consumer,
-    pending: Option<PendingView>,
 }
 
 impl Consumer {
@@ -72,17 +74,11 @@ impl Consumer {
             memory,
             slot,
             notification: notification::Consumer::connected(stream),
-            pending: None,
         })
-    }
-
-    /// Requests `port` from the server at the supplied native socket or pipe path.
-    pub async fn connect(path: impl AsRef<Path>, port: impl Into<String>) -> io::Result<Self> {
-        ConnectOptions::new().connect(path, port).await
     }
 }
 
-impl ConsumerEndpoint for Consumer {
+impl ConsumerState for Consumer {
     type Notification = notification::Consumer;
 
     fn memory(&self) -> &Arc<MappedMemory> {
@@ -100,34 +96,31 @@ impl ConsumerEndpoint for Consumer {
     fn notification_mut(&mut self) -> &mut Self::Notification {
         &mut self.notification
     }
-
-    fn pending(&self) -> Option<PendingView> {
-        self.pending
-    }
-
-    fn pending_mut(&mut self) -> &mut Option<PendingView> {
-        &mut self.pending
-    }
 }
 
-impl View for Consumer {
+// SAFETY: the attached mapping is double-mapped and remains alive with the
+// cursor. The ring operations validate indexed reservations and synchronize
+// shared cursors before returning or advancing them.
+unsafe impl Cursor for Consumer {
     fn capacity(&self) -> usize {
         self.memory.capacity()
     }
 
-    fn try_reserve(&mut self, minimum: usize) -> io::Result<()> {
-        operations::try_reserve(self, minimum)
+    fn position(&self) -> u64 {
+        operations::position(self)
     }
 
-    async fn reserve(&mut self, minimum: usize) -> io::Result<()> {
-        operations::reserve(self, minimum).await
+    fn try_reserve_at(&mut self, position: u64, minimum: usize) -> io::Result<Reservation> {
+        operations::try_reserve_at(self, position, minimum)
     }
 
-    fn view(&self) -> &[u8] {
-        operations::view(self)
+    async fn reserve_at(&mut self, position: u64, minimum: usize) -> io::Result<Reservation> {
+        operations::reserve_at(self, position, minimum).await
     }
 
-    fn advance(&mut self, amount: usize) -> io::Result<()> {
-        operations::advance(self, amount)
+    unsafe fn advance_to(&mut self, position: u64) -> io::Result<()> {
+        // SAFETY: the caller supplies the raw-access and initialization
+        // guarantees required by `Cursor::advance_to`.
+        unsafe { operations::advance_to(self, position) }
     }
 }

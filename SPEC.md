@@ -150,28 +150,29 @@ local reader with `BrokenPipe`. All waits and wakeup I/O run on the caller's
 Tokio runtime. The library creates no runtime, background thread, or persistent
 monitoring task, so disconnect detection is operation-driven.
 
-## Endpoint view API
+## View API
 
-IPC and local endpoints are separate concrete types. `ipc::Producer` and
-`local::Producer` implement `View` and `ViewMut`; `ipc::Consumer` and
-`local::Consumer` implement `View`. The traits are exported at the crate root
-and use static dispatch and native async trait methods. Their returned futures
-have no `Send` guarantee, and the traits are not directly object safe.
+IPC and local producers and consumers are separate types implementing `raw::Cursor`.
+The producer types additionally implement `raw::CursorMut`. These unsafe
+traits provide indexed reservations and absolute cursor advancement; their native
+async reservation futures have no `Send` guarantee and are not directly object
+safe.
 
-Each endpoint retains at most one pending span. A reservation argument is a
-minimum: a successful built-in reservation stores its position, aliased payload
-offset, and the full safe span observed by its successful availability check.
-`view` exposes that fixed snapshot, `view_mut` exposes it mutably for a producer,
-and either returns an empty slice when no reservation is pending. Reserving a
-minimum of zero is the nonblocking way to snapshot current availability.
-Capacity, view access, and local cloning do not change pending state.
+Normal constructors wrap a cursor in `view::View<C>`, which retains at most
+one pending reservation and supplies the safe inherent API. A reservation argument is
+a minimum: a successful built-in reservation stores its position and the full
+safe range observed by its successful availability check. `view` exposes that
+fixed snapshot, `view_mut` exposes it when `C: CursorMut`, and either returns
+an empty slice when no reservation is pending. Reserving a minimum of zero is
+the nonblocking way to snapshot current availability. Capacity, view access,
+and local cloning do not change pending state.
 
-`advance` consumes the pending span. A producer advancement release-publishes
+`advance` consumes the pending reservation. A producer advancement release-publishes
 the selected prefix before notifying waiting readers; a consumer advancement
 release-stores its read cursor before notifying the producer. Notification
 failure never rolls back either cursor. Advancing zero bytes always succeeds
 and clears pending state. A positive advancement without a sufficiently large
-pending span returns `InvalidInput`, clears pending state, and leaves the cursor
+pending reservation returns `InvalidInput`, clears pending state, and leaves the cursor
 unchanged.
 
 Starting `try_reserve` abandons any previous reservation even if the new request
