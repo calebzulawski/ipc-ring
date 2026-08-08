@@ -1,10 +1,10 @@
 //! Producer for a local ring.
 
 use super::notification;
-use crate::mapping::MappedMemory;
-use crate::raw::{Cursor, CursorMut, Reservation};
+use crate::cursor::{Cursor, CursorMut, Reservation};
 #[cfg(test)]
 use crate::ring::Header;
+use crate::ring::mapping::MappedMemory;
 use crate::ring::producer::{self as operations, ProducerState, ReaderCache};
 use crate::ring::reader::ReaderRegistry;
 use arc_swap::Cache;

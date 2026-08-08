@@ -5,11 +5,8 @@
 //! - Asynchronous waiting with slowest-consumer backpressure.
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod cursor;
 mod error;
-pub mod ipc;
-pub mod local;
-mod mapping;
-pub mod raw;
-mod ring;
+pub mod ring;
 mod sys;
 pub mod view;

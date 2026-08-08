@@ -3,10 +3,10 @@
 use super::handshake;
 use super::notification;
 use super::socket::ConsumerStream;
-use crate::mapping::MappedMemory;
-use crate::raw::{Cursor, Reservation};
+use crate::cursor::{Cursor, Reservation};
 use crate::ring::MAX_READERS;
 use crate::ring::consumer::{self as operations, ConsumerState};
+use crate::ring::mapping::MappedMemory;
 use crate::view::View;
 use std::io;
 use std::path::Path;

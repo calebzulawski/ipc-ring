@@ -1,6 +1,6 @@
 use super::protocol;
-use crate::ipc::socket::{self, ConsumerStream};
-use crate::mapping::{self, MappedMemory, SharedMemory};
+use crate::ring::ipc::socket::{self, ConsumerStream};
+use crate::ring::mapping::{self, MappedMemory, SharedMemory};
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;

@@ -1,6 +1,6 @@
 use super::{Server, ServerRegistry};
-use crate::ipc::handshake;
-use crate::ipc::socket::{self, Listener};
+use crate::ring::ipc::handshake;
+use crate::ring::ipc::socket::{self, Listener};
 use std::future::Future;
 use std::io;
 use std::path::Path;

@@ -2,8 +2,8 @@
 
 use super::notification;
 use super::registered::RegisteredRing;
-use crate::mapping::MappedMemory;
-use crate::raw::{Cursor, CursorMut, Reservation};
+use crate::cursor::{Cursor, CursorMut, Reservation};
+use crate::ring::mapping::MappedMemory;
 use crate::ring::producer::{self as operations, ProducerState, ReaderCache};
 use crate::ring::reader::ReaderRegistry;
 use arc_swap::Cache;

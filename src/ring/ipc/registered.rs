@@ -1,6 +1,6 @@
 use super::notification;
 use super::reader::ReaderClaim;
-use crate::mapping::{self, MappedMemory, SharedMemory};
+use crate::ring::mapping::{self, MappedMemory, SharedMemory};
 use crate::ring::reader::ReaderRegistry;
 use std::io;
 use std::sync::Arc;

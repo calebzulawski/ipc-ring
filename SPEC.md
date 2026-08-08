@@ -111,9 +111,9 @@ Each active IPC reader has one full-duplex socket or pipe used only for
 wakeups. A wakeup is one zero byte: it carries no payload and tells the receiver
 to recheck shared positions. Local rings use the same cursor, bitmap,
 immutable-membership, and slot-admission protocol with one independent pair of
-process-local Tokio notifications per reader. `local::Consumer::try_clone`
+process-local Tokio notifications per reader. `ring::local::Consumer::try_fork`
 atomically reserves a new slot and initializes it from the source consumer's
-current read cursor. The clone therefore inherits the source's unread bytes and
+current read cursor. The fork therefore inherits the source's unread bytes and
 then receives future publications independently.
 
 The producer's writable length is the capacity minus the greatest buffered
@@ -152,8 +152,8 @@ monitoring task, so disconnect detection is operation-driven.
 
 ## View API
 
-IPC and local producers and consumers are separate types implementing `raw::Cursor`.
-The producer types additionally implement `raw::CursorMut`. These unsafe
+`ring::ipc` and `ring::local` producers and consumers are separate types implementing `cursor::Cursor`.
+The producer types additionally implement `cursor::CursorMut`. These unsafe
 traits provide indexed reservations and absolute cursor advancement; their native
 async reservation futures have no `Send` guarantee and are not directly object
 safe.
@@ -165,7 +165,11 @@ safe range observed by its successful availability check. `view` exposes that
 fixed snapshot, `view_mut` exposes it when `C: CursorMut`, and either returns
 an empty slice when no reservation is pending. Reserving a minimum of zero is
 the nonblocking way to snapshot current availability. Capacity, view access,
-and local cloning do not change pending state.
+and local forking do not change pending state. `cursor::TryFork` is an
+independent capability: a successful fork starts at the source cursor's current
+logical position, receives future input independently, and cannot invalidate
+the source's eligible reservations when it advances. `View::try_fork` creates a
+view with no pending reservation while leaving the source view unchanged.
 
 `advance` consumes the pending reservation. A producer advancement release-publishes
 the selected prefix before notifying waiting readers; a consumer advancement

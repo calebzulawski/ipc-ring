@@ -1,4 +1,4 @@
-use crate::ipc::socket::{ConsumerStream, HandshakeStream, ProducerStream};
+use crate::ring::ipc::socket::{ConsumerStream, HandshakeStream, ProducerStream};
 use std::io::{self, IoSlice, IoSliceMut};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, OwnedFd};
@@ -89,8 +89,8 @@ mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
 
-    fn mapping() -> crate::mapping::SharedMemory {
-        crate::mapping::create(crate::mapping::minimum_capacity())
+    fn mapping() -> crate::ring::mapping::SharedMemory {
+        crate::ring::mapping::create(crate::ring::mapping::minimum_capacity())
             .unwrap()
             .0
     }
@@ -98,7 +98,7 @@ mod tests {
     #[tokio::test]
     async fn received_mapping_descriptor_is_close_on_exec() {
         let mapping = mapping();
-        let (sender, mut receiver) = crate::ipc::socket::pair().unwrap();
+        let (sender, mut receiver) = crate::ring::ipc::socket::pair().unwrap();
         let _sender = send_mapping_handle(sender, &mapping).await.unwrap();
         let received = receive_mapping_handle(&mut receiver).await.unwrap();
 
@@ -111,7 +111,7 @@ mod tests {
         let mapping = mapping();
         let first = mapping.duplicate_descriptor().unwrap();
         let second = mapping.duplicate_descriptor().unwrap();
-        let (sender, mut receiver) = crate::ipc::socket::pair().unwrap();
+        let (sender, mut receiver) = crate::ring::ipc::socket::pair().unwrap();
         let marker = [0_u8];
         sender
             .async_io(tokio::io::Interest::WRITABLE, || {
@@ -137,7 +137,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_mapping_descriptor_is_rejected() {
-        let (mut sender, mut receiver) = crate::ipc::socket::pair().unwrap();
+        let (mut sender, mut receiver) = crate::ring::ipc::socket::pair().unwrap();
         sender.write_all(&[0]).await.unwrap();
         let cause = receive_mapping_handle(&mut receiver).await.unwrap_err();
 

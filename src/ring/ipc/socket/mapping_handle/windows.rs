@@ -1,4 +1,4 @@
-use crate::ipc::socket::{ConsumerStream, HandshakeStream, ProducerStream};
+use crate::ring::ipc::socket::{ConsumerStream, HandshakeStream, ProducerStream};
 use scopeguard::ScopeGuard;
 use std::ffi::c_void;
 use std::io;

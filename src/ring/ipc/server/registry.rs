@@ -1,6 +1,6 @@
-use crate::ipc::Producer;
-use crate::ipc::handshake;
-use crate::ipc::registered::RegisteredRing;
+use crate::ring::ipc::Producer;
+use crate::ring::ipc::handshake;
+use crate::ring::ipc::registered::RegisteredRing;
 use crate::view::View;
 use std::collections::HashMap;
 use std::io;

@@ -2,9 +2,9 @@
 
 use super::state::{input_distance, set_waiter_bit, used, valid_len};
 use super::wake::ConsumerWake;
+use crate::cursor::Reservation;
 use crate::error;
-use crate::mapping::MappedMemory;
-use crate::raw::Reservation;
+use crate::ring::mapping::MappedMemory;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;

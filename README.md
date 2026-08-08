@@ -5,7 +5,7 @@ A zero-copy fan-out ring buffer for interprocess communication.
 The Rust implementation provides single-producer rings on Linux, macOS, and
 Windows. Server-backed and process-local rings support up to 64 independent
 readers. New server-backed readers receive bytes published after attachment;
-cloned local readers inherit the source reader's current cursor. The slowest
+forked local readers inherit the source reader's current cursor. The slowest
 active reader provides backpressure. A server-backed producer remains writable
 with no readers, while a local producer reports `BrokenPipe` after its final
 reader disappears. One local server routes clients to any number of rings by
@@ -17,7 +17,7 @@ stale or retired socket files. On Windows it is a complete local named-pipe
 path such as `\\.\pipe\my-ring`.
 
 ```rust,no_run
-use ipc_ring::ipc::{ConnectOptions, Server};
+use ipc_ring::ring::ipc::{ConnectOptions, Server};
 
 # async fn example() -> std::io::Result<()> {
 let (server, task) = Server::bind("/tmp/my-service.sock")?;
@@ -41,16 +41,16 @@ router.abort();
 # }
 ```
 
-For an in-process ring, `local::create(capacity)` returns safe views over a
-`local::Producer` and `local::Consumer`. Additional local readers can be
-created with `try_clone` on the consumer view:
+For an in-process ring, `ring::local::create(capacity)` returns safe views over a
+`ring::local::Producer` and `ring::local::Consumer`. Additional local readers can be
+created with `try_fork` on the consumer view:
 
 ```rust
-use ipc_ring::local;
+use ipc_ring::ring::local;
 
 # fn example() -> std::io::Result<()> {
 let (mut producer, mut consumer) = local::create(1024)?;
-let mut second_consumer = consumer.try_clone()?;
+let mut second_consumer = consumer.try_fork()?;
 
 producer.try_reserve(4)?;
 producer.view_mut()[..4].copy_from_slice(b"ping");
@@ -62,18 +62,23 @@ second_consumer.try_reserve(4)?;
 # }
 ```
 
+Forking is a separate cursor capability, `cursor::TryFork`, rather than a
+requirement of `cursor::Cursor`. It is fallible because native fan-out may need to
+claim a bounded reader slot. Neither cursor nor view implements ordinary
+`Clone`.
+
 Listener binding is synchronous. Consumer connection, routing, and ring waits
 run entirely on the caller's Tokio runtime. Immediate reservations and cursor
 advancement remain synchronous. The local and IPC producer and consumer types implement
-`raw::Cursor`; constructors wrap them in `view::View`, which retains one safe
-reservation. Producers additionally implement `raw::CursorMut`, enabling
+`cursor::Cursor`; constructors wrap them in `view::View`, which retains one safe
+reservation. Producers additionally implement `cursor::CursorMut`, enabling
 in-place modification through `view_mut`. Reservations request a minimum
 length and expose the full availability snapshot observed by their successful
 check.
 
 Each complete handshake has a one-second default timeout.
-`ipc::ServerOptions::handshake_timeout` and
-`ipc::ConnectOptions::handshake_timeout` configure the server and consumer
+`ring::ipc::ServerOptions::handshake_timeout` and
+`ring::ipc::ConnectOptions::handshake_timeout` configure the server and consumer
 independently.
 
 See [SPEC.md](SPEC.md) for the memory layout and synchronization protocol.

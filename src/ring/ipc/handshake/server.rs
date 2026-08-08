@@ -1,6 +1,6 @@
 use super::protocol;
-use crate::ipc::server::ServerRegistry;
-use crate::ipc::socket::{self, HandshakeStream};
+use crate::ring::ipc::server::ServerRegistry;
+use crate::ring::ipc::socket::{self, HandshakeStream};
 use std::io;
 use std::sync::Weak;
 use std::time::Duration;

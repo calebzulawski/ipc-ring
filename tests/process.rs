@@ -1,4 +1,4 @@
-use ipc_ring::ipc::{ConnectOptions, Server};
+use ipc_ring::ring::ipc::{ConnectOptions, Server};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;

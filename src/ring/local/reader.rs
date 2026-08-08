@@ -1,7 +1,7 @@
 //! Local reader admission and lifetime guards.
 
 use super::notification;
-use crate::mapping::MappedMemory;
+use crate::ring::mapping::MappedMemory;
 use crate::ring::reader::{ReaderConnection, ReaderRegistry};
 use std::io;
 use std::sync::{Arc, Weak};

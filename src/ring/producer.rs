@@ -3,9 +3,9 @@
 use super::reader::{ActiveReaders, ReaderConnection, ReaderRegistry};
 use super::state::{input_distance, set_waiter_bit, valid_len};
 use super::wake::ProducerWake;
+use crate::cursor::Reservation;
 use crate::error;
-use crate::mapping::MappedMemory;
-use crate::raw::Reservation;
+use crate::ring::mapping::MappedMemory;
 use arc_swap::{ArcSwap, Cache};
 use std::io;
 use std::sync::Arc;

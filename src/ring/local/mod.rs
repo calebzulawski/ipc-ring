@@ -5,11 +5,11 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use ipc_ring::local;
+//! use ipc_ring::ring::local;
 //!
 //! # fn setup() -> std::io::Result<()> {
 //! let (producer, consumer) = local::create(64 * 1024)?;
-//! let second_consumer = consumer.try_clone()?;
+//! let second_consumer = consumer.try_fork()?;
 //! # let _ = (producer, consumer, second_consumer);
 //! # Ok(())
 //! # }
@@ -23,7 +23,7 @@ mod reader;
 pub use consumer::Consumer;
 pub use producer::Producer;
 
-use crate::mapping;
+use crate::ring::mapping;
 use crate::view::View;
 use std::io;
 use std::sync::Arc;

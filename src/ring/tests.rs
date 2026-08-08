@@ -1,6 +1,6 @@
-use crate::local;
-use crate::mapping;
-use crate::raw::Cursor;
+use crate::cursor::Cursor;
+use crate::ring::local;
+use crate::ring::mapping;
 use std::io::ErrorKind;
 use std::sync::atomic::Ordering;
 

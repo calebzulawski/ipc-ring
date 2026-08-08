@@ -1,5 +1,5 @@
-use ipc_ring::local;
-use ipc_ring::raw::{Cursor, CursorMut};
+use ipc_ring::cursor::{Cursor, CursorMut};
+use ipc_ring::ring::local;
 use ipc_ring::view::View;
 use std::io;
 use std::io::ErrorKind;
@@ -183,7 +183,7 @@ async fn reservation_start_and_poll_abandon_previous_views() {
 }
 
 #[tokio::test]
-async fn capacity_view_access_and_cloning_preserve_pending_state() {
+async fn capacity_view_access_and_forking_preserve_pending_state() {
     let (mut producer, mut consumer) = local::create(1).unwrap();
     producer.try_reserve(4).unwrap();
     producer.view_mut()[..4].copy_from_slice(b"data");
@@ -193,18 +193,18 @@ async fn capacity_view_access_and_cloning_preserve_pending_state() {
 
     consumer.try_reserve(4).unwrap();
     let _ = consumer.capacity();
-    let mut clone = consumer.try_clone().unwrap();
+    let mut fork = consumer.try_fork().unwrap();
     assert_eq!(&consumer.view()[..4], b"data");
-    clone.try_reserve(0).unwrap();
-    assert_eq!(clone.view().len(), 4);
+    fork.try_reserve(0).unwrap();
+    assert_eq!(fork.view().len(), 4);
     consumer.advance(4).unwrap();
-    clone.reserve(4).await.unwrap();
-    assert_eq!(&clone.view()[..4], b"data");
-    clone.advance(4).unwrap();
+    fork.reserve(4).await.unwrap();
+    assert_eq!(&fork.view()[..4], b"data");
+    fork.advance(4).unwrap();
 }
 
 #[tokio::test]
-async fn local_clones_inherit_unread_data_and_receive_future_data_independently() {
+async fn local_forks_inherit_unread_data_and_receive_future_data_independently() {
     let (mut producer, mut first) = local::create(1).unwrap();
     producer.reserve(4).await.unwrap();
     producer.view_mut()[..4].copy_from_slice(b"past");
@@ -214,7 +214,7 @@ async fn local_clones_inherit_unread_data_and_receive_future_data_independently(
     assert_eq!(first.view().len(), 4);
     assert_eq!(&first.view()[..2], b"pa");
     first.advance(2).unwrap();
-    let mut second = first.try_clone().unwrap();
+    let mut second = first.try_fork().unwrap();
 
     first.reserve(2).await.unwrap();
     second.reserve(2).await.unwrap();
@@ -235,9 +235,9 @@ async fn local_clones_inherit_unread_data_and_receive_future_data_independently(
 }
 
 #[tokio::test]
-async fn slowest_local_clone_controls_backpressure() {
+async fn slowest_local_fork_controls_backpressure() {
     let (mut producer, mut first) = local::create(1).unwrap();
-    let mut second = first.try_clone().unwrap();
+    let mut second = first.try_fork().unwrap();
     let capacity = producer.capacity();
 
     producer.reserve(capacity).await.unwrap();
@@ -263,7 +263,7 @@ fn local_reader_admission_is_concurrent_bounded_and_reusable() {
         let handles = (0..16)
             .map(|_| {
                 let first = Arc::clone(&first);
-                scope.spawn(move || first.try_clone().unwrap())
+                scope.spawn(move || first.try_fork().unwrap())
             })
             .collect::<Vec<_>>();
         handles
@@ -273,22 +273,22 @@ fn local_reader_admission_is_concurrent_bounded_and_reusable() {
     });
 
     while readers.len() < 63 {
-        readers.push(first.try_clone().unwrap());
+        readers.push(first.try_fork().unwrap());
     }
     assert_eq!(
-        first.try_clone().err().unwrap().kind(),
+        first.try_fork().err().unwrap().kind(),
         ErrorKind::ResourceBusy
     );
 
     drop(readers.pop());
-    readers.push(first.try_clone().unwrap());
+    readers.push(first.try_fork().unwrap());
     assert!(producer.try_reserve(1).is_ok());
 }
 
 #[tokio::test]
 async fn local_reader_removal_is_independent_and_final() {
     let (mut producer, first) = local::create(1).unwrap();
-    let second = first.try_clone().unwrap();
+    let second = first.try_fork().unwrap();
     drop(second);
     producer.try_reserve(1).unwrap();
     producer.advance(1).unwrap();
@@ -299,11 +299,21 @@ async fn local_reader_removal_is_independent_and_final() {
     );
 
     let (producer, first) = local::create(1).unwrap();
-    let mut second = first.try_clone().unwrap();
+    let mut second = first.try_fork().unwrap();
     drop(first);
     drop(producer);
     assert_eq!(
         second.reserve(1).await.unwrap_err().kind(),
+        ErrorKind::BrokenPipe
+    );
+}
+
+#[test]
+fn forking_reports_a_disconnected_local_registry() {
+    let (producer, consumer) = local::create(1).unwrap();
+    drop(producer);
+    assert_eq!(
+        consumer.try_fork().err().unwrap().kind(),
         ErrorKind::BrokenPipe
     );
 }

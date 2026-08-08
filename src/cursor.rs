@@ -78,6 +78,29 @@ pub unsafe trait Cursor {
     unsafe fn advance_to(&mut self, position: u64) -> io::Result<()>;
 }
 
+/// Marks a cursor that can create an independent cursor at its current position.
+///
+/// A fork begins at the source cursor's current logical position. Advancing or
+/// dropping either cursor must not advance, invalidate, or otherwise change the
+/// other cursor. Both cursors must continue to observe the same future input,
+/// subject to the underlying source's documented retention and backpressure
+/// behavior.
+///
+/// Forking is fallible because it may require an operating-system resource, a
+/// reader slot, or other bounded storage. Types that cannot provide independent
+/// cursors do not implement this trait; runtime failures are returned as errors.
+///
+/// # Safety
+///
+/// Implementations must ensure that each successful fork independently upholds
+/// the full [`Cursor`] reservation-lifetime contract. In particular, advancing
+/// one fork must not permit storage to be changed or reused while a reservation
+/// belonging to another fork remains eligible for access.
+pub unsafe trait TryFork: Cursor + Sized {
+    /// Creates an independent cursor beginning at this cursor's current position.
+    fn try_fork(&self) -> io::Result<Self>;
+}
+
 /// Marks a cursor whose reservations may be changed in place.
 ///
 /// # Safety
@@ -90,12 +113,13 @@ pub unsafe trait CursorMut: Cursor {}
 
 #[cfg(test)]
 mod tests {
-    use super::{Cursor, CursorMut, Reservation};
-    use crate::{ipc, local};
+    use super::{Cursor, CursorMut, Reservation, TryFork};
+    use crate::ring::{ipc, local};
 
     fn assert_copy_send_sync<T: Copy + Send + Sync>() {}
     fn assert_cursor<T: Cursor>() {}
     fn assert_cursor_mut<T: CursorMut>() {}
+    fn assert_try_fork<T: TryFork>() {}
 
     #[test]
     fn reservation_is_inert_copyable_thread_safe_metadata() {
@@ -116,6 +140,7 @@ mod tests {
     fn cursor_capabilities_match_their_ring_roles() {
         assert_cursor::<local::Consumer>();
         assert_cursor::<ipc::Consumer>();
+        assert_try_fork::<local::Consumer>();
         assert_cursor_mut::<local::Producer>();
         assert_cursor_mut::<ipc::Producer>();
     }

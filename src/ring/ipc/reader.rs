@@ -68,8 +68,8 @@ impl ReaderClaim {
 #[cfg(test)]
 mod tests {
     use super::Registry;
-    use crate::mapping;
     use crate::ring::MAX_READERS;
+    use crate::ring::mapping;
     use std::io::ErrorKind;
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Barrier};

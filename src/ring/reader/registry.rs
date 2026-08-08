@@ -1,8 +1,8 @@
 //! Reserves reader slots during attachment and publishes completed connections.
 
 use super::{ReaderConnection, SlotLease};
-use crate::mapping::MappedMemory;
 use crate::ring::MAX_READERS;
+use crate::ring::mapping::MappedMemory;
 use crate::ring::wake::ProducerWake;
 use arc_swap::ArcSwap;
 use std::io;

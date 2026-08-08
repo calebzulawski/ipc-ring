@@ -1,6 +1,6 @@
-use ipc_ring::ipc::{ConnectOptions, Consumer, Producer, Server, ServerOptions};
-use ipc_ring::local;
-use ipc_ring::raw::Cursor;
+use ipc_ring::cursor::Cursor;
+use ipc_ring::ring::ipc::{ConnectOptions, Consumer, Producer, Server, ServerOptions};
+use ipc_ring::ring::local;
 use ipc_ring::view::View;
 use std::io;
 use std::io::ErrorKind;

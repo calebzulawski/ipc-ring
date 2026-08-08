@@ -2,11 +2,11 @@
 
 use super::notification;
 use super::reader;
-use crate::mapping::MappedMemory;
-use crate::raw::{Cursor, Reservation};
+use crate::cursor::{Cursor, Reservation, TryFork};
 #[cfg(test)]
 use crate::ring::Header;
 use crate::ring::consumer::{self as operations, ConsumerState};
+use crate::ring::mapping::MappedMemory;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -34,7 +34,7 @@ impl Consumer {
         }
     }
 
-    fn try_clone(&self) -> io::Result<Self> {
+    fn fork_inner(&self) -> io::Result<Self> {
         let (producer_notification, notification) = notification::pair();
         let read_position =
             self.memory.header().read_positions[self.slot as usize].load(Ordering::Acquire);
@@ -47,6 +47,16 @@ impl Consumer {
             notification,
             local_reader,
         })
+    }
+}
+
+// SAFETY: each fork claims and publishes a distinct reader slot at the source
+// consumer's acquired read position. The producer retains bytes until every
+// active slot advances, so one fork cannot invalidate another fork's eligible
+// reservations.
+unsafe impl TryFork for Consumer {
+    fn try_fork(&self) -> io::Result<Self> {
+        self.fork_inner()
     }
 }
 
@@ -98,11 +108,6 @@ unsafe impl Cursor for Consumer {
 }
 
 impl crate::view::View<Consumer> {
-    /// Creates an independent reader beginning at this reader's current cursor.
-    pub fn try_clone(&self) -> io::Result<Self> {
-        Ok(Self::from_cursor(self.cursor().try_clone()?))
-    }
-
     #[cfg(test)]
     pub(crate) fn header(&self) -> &Header {
         self.cursor().memory.header()

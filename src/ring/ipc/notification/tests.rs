@@ -80,7 +80,7 @@ async fn wake_byte_io_validates_zero_and_reports_eof_as_broken_pipe() {
 #[cfg(unix)]
 async fn installation_sends_one_reconciliation_wake() {
     let notification = Producer::pending();
-    let (mut stream, mut peer) = crate::ipc::socket::pair().unwrap();
+    let (mut stream, mut peer) = crate::ring::ipc::socket::pair().unwrap();
     stream.write_u8(0).await.unwrap();
     assert_eq!(peer.read_u8().await.unwrap(), 0);
     notification.try_wake().unwrap();
@@ -129,7 +129,7 @@ async fn closing_a_pending_producer_notification_wakes_its_reader() {
 async fn a_closed_notification_rejects_stream_installation() {
     let notification = Producer::pending();
     notification.close();
-    let (stream, _peer) = crate::ipc::socket::pair().unwrap();
+    let (stream, _peer) = crate::ring::ipc::socket::pair().unwrap();
 
     assert_eq!(
         notification.install(stream).unwrap_err().kind(),
@@ -141,7 +141,7 @@ async fn a_closed_notification_rejects_stream_installation() {
 #[cfg(unix)]
 async fn closing_an_installed_producer_notification_interrupts_its_read() {
     let notification = Arc::new(Producer::pending());
-    let (stream, _peer) = crate::ipc::socket::pair().unwrap();
+    let (stream, _peer) = crate::ring::ipc::socket::pair().unwrap();
     notification.install(stream).unwrap();
 
     let read = {

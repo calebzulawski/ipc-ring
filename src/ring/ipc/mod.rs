@@ -7,7 +7,7 @@
 //! # Write side
 //!
 //! ```rust,no_run
-//! use ipc_ring::ipc::Server;
+//! use ipc_ring::ring::ipc::Server;
 //!
 //! # async fn write_side() -> std::io::Result<()> {
 //! let (server, server_task) = Server::bind("/tmp/example.sock")?;
@@ -20,7 +20,7 @@
 //! # Read side
 //!
 //! ```rust,no_run
-//! use ipc_ring::ipc::ConnectOptions;
+//! use ipc_ring::ring::ipc::ConnectOptions;
 //!
 //! # async fn read_side() -> std::io::Result<()> {
 //! let _consumer = ConnectOptions::new()

@@ -1,6 +1,6 @@
 //! Safe stateful access to indexed byte cursors.
 
-use crate::raw::{Cursor, CursorMut, Reservation};
+use crate::cursor::{Cursor, CursorMut, Reservation, TryFork};
 use std::io;
 use std::slice;
 
@@ -22,7 +22,7 @@ use std::slice;
 ///
 /// ```
 /// fn send_one_message() -> std::io::Result<()> {
-///     let (mut producer, mut consumer) = ipc_ring::local::create(1)?;
+///     let (mut producer, mut consumer) = ipc_ring::ring::local::create(1)?;
 ///
 ///     producer.try_reserve(4)?;
 ///     producer.view_mut()[..4].copy_from_slice(b"ping");
@@ -47,6 +47,7 @@ impl<C: Cursor> View<C> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn cursor(&self) -> &C {
         &self.cursor
     }
@@ -121,13 +122,23 @@ impl<C: Cursor> View<C> {
     }
 }
 
+impl<C: TryFork> View<C> {
+    /// Creates an independent cursor beginning at this view's current position.
+    ///
+    /// The new view has no pending reservation. Forking does not change this
+    /// view or clear its pending reservation.
+    pub fn try_fork(&self) -> io::Result<Self> {
+        Ok(Self::from_cursor(self.cursor.try_fork()?))
+    }
+}
+
 impl<C: CursorMut> View<C> {
     /// Returns the reserved bytes for in-place modification.
     ///
     /// Consumer views do not provide mutable access:
     ///
     /// ```compile_fail
-    /// let (_, mut consumer) = ipc_ring::local::create(1).unwrap();
+    /// let (_, mut consumer) = ipc_ring::ring::local::create(1).unwrap();
     /// consumer.view_mut();
     /// ```
     pub fn view_mut(&mut self) -> &mut [u8] {
