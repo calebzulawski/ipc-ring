@@ -329,9 +329,10 @@ mod tests {
 
     #[test]
     fn attachment_accepts_trailing_shared_memory() {
-        let (shared_memory, memory) = create(minimum_capacity()).unwrap();
-        let expanded = shared_memory_len(shared_memory.descriptor()).unwrap() + page_size() as u64;
-        rustix::fs::ftruncate(shared_memory.descriptor(), expanded).unwrap();
+        let layout = Layout::for_minimum_capacity(minimum_capacity()).unwrap();
+        let expanded = layout.shared_memory_len + page_size() as u64;
+        let shared_memory = SharedMemory::anonymous(expanded).unwrap();
+        let memory = MappedMemory::create(&shared_memory, &layout).unwrap();
 
         // SAFETY: the test supplies the mapping created and initialized above.
         let attached = unsafe { attach(&shared_memory) }.unwrap();
